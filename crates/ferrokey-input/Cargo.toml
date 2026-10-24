@@ -8,5 +8,10 @@ repository.workspace = true
 [dependencies]
 ferrokey-protocol.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `screencast` is only needed because ashpd's remote_desktop module imports it.
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+
 [lints]
 workspace = true
