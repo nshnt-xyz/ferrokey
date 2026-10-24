@@ -1,0 +1,13 @@
+[package]
+name = "ferrokey-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrokey-protocol.workspace = true
+ferrokey-input.workspace = true
+
+[lints]
+workspace = true
