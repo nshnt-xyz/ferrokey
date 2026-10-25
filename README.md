@@ -20,3 +20,30 @@ fallback backend, used when the portal is unavailable:
 - **`/dev/uinput`**: creates a virtual kernel input device, so it works on any
   compositor (and X11/TTY), but needs write access to `/dev/uinput` (udev rule
   or `input` group).
+
+## Android app
+
+`android/` is a Kotlin + Jetpack Compose app. Its core is the
+`ferrokey-mobile` Rust crate, exposed to Kotlin through
+[UniFFI](https://mozilla.github.io/uniffi-rs/), so the app and the server
+share the same protocol types. The Gradle build cross-compiles the crate with
+[cargo-ndk](https://github.com/bbqsrc/cargo-ndk) and generates the Kotlin
+bindings automatically.
+
+Prerequisites:
+
+```sh
+rustup target add aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk
+```
+
+plus the Android SDK (`ANDROID_HOME` or `android/local.properties`). The NDK
+version pinned in `app/build.gradle.kts` is installed by Gradle if missing.
+
+```sh
+cd android
+./gradlew assembleDebug
+```
+
+The app currently shows a touchpad and left/right buttons; there's no
+networking yet, so events are only counted.
