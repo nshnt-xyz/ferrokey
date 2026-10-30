@@ -1,6 +1,24 @@
 # ferrokey
 Cross-platform remote mouse and keyboard control (Linux Wayland + Windows), written in Rust
 
+## Quick start
+
+```sh
+scripts/build.sh   # server + client (release) and the Android APK (debug)
+scripts/run.sh     # build, install the app on USB phones, start the server
+```
+
+`scripts/run.sh` installs and launches the app on every phone connected over
+USB with USB debugging on (emulators are skipped), and sets up `adb reverse`
+so the phone can reach the server at `127.0.0.1` over the cable, no shared
+Wi-Fi needed. It then runs the server in the foreground; extra arguments go to
+the server, e.g. `scripts/run.sh --pair` or `scripts/run.sh --no-build
+--print-events`. The USB forward is for the default port 47800.
+
+Both scripts need the Android build prerequisites listed under
+[Android app](#android-app). They're bash, so on Windows run them from WSL or
+Git Bash.
+
 ## Running the server
 
 ```sh
