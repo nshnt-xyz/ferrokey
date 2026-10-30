@@ -3,9 +3,15 @@
 //! The Kotlin bindings are generated from this crate at build time, so the
 //! app always speaks the same [`InputEvent`] types as the server.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
+use ferrokey_net::{KEEPALIVE_INTERVAL, Keypair, PublicKey, client};
 use ferrokey_protocol::{InputEvent, MouseButton};
 
 uniffi::setup_scaffolding!();
@@ -25,27 +31,211 @@ pub enum MouseButton {
     Middle,
 }
 
-/// Connection to a ferrokey server.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum ClientError {
+    #[error("{0}")]
+    Connection(#[from] ferrokey_net::Error),
+    #[error("not paired with {0}")]
+    NotPaired(String),
+    #[error("not connected")]
+    NotConnected,
+    #[error("storage error: {0}")]
+    Storage(#[from] io::Error),
+}
+
+/// A server this device has paired with.
+#[derive(uniffi::Record)]
+pub struct PairedServer {
+    pub address: String,
+    /// Matches the fingerprint the server prints on startup.
+    pub fingerprint: String,
+}
+
+/// This device's identity, its paired servers, and the current connection.
 ///
-/// There is no networking yet: events are counted and dropped.
-#[derive(uniffi::Object, Default)]
+/// `pair` and `connect` block on the network, so call them off the main
+/// thread. `send` only queues the event and is safe to call from anywhere.
+#[derive(uniffi::Object)]
 pub struct Client {
-    events_sent: AtomicU64,
+    data_dir: PathBuf,
+    device_name: String,
+    keypair: Keypair,
+    servers: Mutex<Vec<(String, PublicKey)>>,
+    connection: Mutex<Option<Connection>>,
 }
 
 #[uniffi::export]
 impl Client {
+    /// Loads or creates this device's key and paired servers in `data_dir`.
     #[uniffi::constructor]
-    pub fn new() -> Arc<Self> {
-        Arc::default()
+    pub fn new(data_dir: String, device_name: String) -> Result<Arc<Self>, ClientError> {
+        let data_dir = PathBuf::from(data_dir);
+        fs::create_dir_all(&data_dir)?;
+        Ok(Arc::new(Self {
+            keypair: load_or_create_keypair(&data_dir.join("device.key"))?,
+            servers: Mutex::new(load_servers(&data_dir.join("servers"))?),
+            data_dir,
+            device_name,
+            connection: Mutex::new(None),
+        }))
     }
 
-    pub fn send(&self, _event: InputEvent) {
-        self.events_sent.fetch_add(1, Ordering::Relaxed);
+    pub fn paired_servers(&self) -> Vec<PairedServer> {
+        self.servers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(address, key)| PairedServer {
+                address: address.clone(),
+                fingerprint: key.fingerprint(),
+            })
+            .collect()
     }
 
-    /// Number of events passed to [`Client::send`] so far.
-    pub fn events_sent(&self) -> u64 {
-        self.events_sent.load(Ordering::Relaxed)
+    /// Pairs with the server at `address` using the code it displays, then
+    /// stays connected to it.
+    pub fn pair(&self, address: String, code: String) -> Result<(), ClientError> {
+        self.disconnect();
+        let address = address.trim().to_owned();
+        let session = client::pair(&address, &code, &self.keypair, &self.device_name)?;
+
+        let mut servers = self.servers.lock().unwrap();
+        servers.retain(|(existing, _)| *existing != address);
+        servers.push((address, session.server_key()));
+        save_servers(&self.data_dir.join("servers"), &servers)?;
+        drop(servers);
+
+        *self.connection.lock().unwrap() = Some(Connection::start(session));
+        Ok(())
     }
+
+    /// Connects to a server paired earlier.
+    pub fn connect(&self, address: String) -> Result<(), ClientError> {
+        self.disconnect();
+        let server_key = self
+            .servers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(existing, _)| *existing == address)
+            .map(|(_, key)| *key)
+            .ok_or_else(|| ClientError::NotPaired(address.clone()))?;
+        let session = client::connect(&address, &self.keypair, &server_key, &self.device_name)?;
+        *self.connection.lock().unwrap() = Some(Connection::start(session));
+        Ok(())
+    }
+
+    /// Removes a paired server. Pairing with it again needs a new code.
+    pub fn forget(&self, address: String) -> Result<(), ClientError> {
+        let mut servers = self.servers.lock().unwrap();
+        servers.retain(|(existing, _)| *existing != address);
+        save_servers(&self.data_dir.join("servers"), &servers)?;
+        Ok(())
+    }
+
+    pub fn disconnect(&self) {
+        // Dropping the connection's sender stops its thread.
+        self.connection.lock().unwrap().take();
+    }
+
+    /// Whether a connection is open. Turns false shortly after the server
+    /// goes away, once a send or keepalive fails.
+    pub fn is_connected(&self) -> bool {
+        self.connection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(Connection::is_alive)
+    }
+
+    pub fn send(&self, event: InputEvent) -> Result<(), ClientError> {
+        let connection = self.connection.lock().unwrap();
+        let connection = connection
+            .as_ref()
+            .filter(|c| c.is_alive())
+            .ok_or(ClientError::NotConnected)?;
+        connection
+            .events
+            .send(event)
+            .map_err(|_| ClientError::NotConnected)
+    }
+}
+
+/// An open session, written to by a dedicated thread so that sending never
+/// blocks the caller.
+struct Connection {
+    events: mpsc::Sender<InputEvent>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Connection {
+    fn start(mut session: client::Session) -> Self {
+        let (events, rx) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
+        let thread_alive = alive.clone();
+        thread::spawn(move || {
+            let mut batch = Vec::new();
+            loop {
+                let result = match rx.recv_timeout(KEEPALIVE_INTERVAL) {
+                    Ok(event) => {
+                        // Coalesce whatever queued up while the last write ran.
+                        batch.clear();
+                        batch.push(event);
+                        batch.extend(rx.try_iter());
+                        session.send_events(&batch)
+                    }
+                    Err(RecvTimeoutError::Timeout) => session.send_keepalive(),
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                if result.is_err() {
+                    break;
+                }
+            }
+            thread_alive.store(false, Ordering::Relaxed);
+            session.shutdown();
+        });
+        Self { events, alive }
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+}
+
+fn load_or_create_keypair(path: &Path) -> io::Result<Keypair> {
+    match fs::read(path) {
+        Ok(bytes) => Keypair::from_bytes(&bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "device key is corrupt")),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let keypair = Keypair::generate().map_err(io::Error::other)?;
+            fs::write(path, keypair.to_bytes())?;
+            Ok(keypair)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Reads `<hex server key> <address>` lines.
+fn load_servers(path: &Path) -> io::Result<Vec<(String, PublicKey)>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    Ok(contents
+        .lines()
+        .filter_map(|line| {
+            let (key, address) = line.split_once(' ')?;
+            Some((address.to_owned(), PublicKey::from_hex(key)?))
+        })
+        .collect())
+}
+
+fn save_servers(path: &Path, servers: &[(String, PublicKey)]) -> io::Result<()> {
+    let contents: String = servers
+        .iter()
+        .map(|(address, key)| format!("{} {address}\n", key.to_hex()))
+        .collect();
+    fs::write(path, contents)
 }

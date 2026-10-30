@@ -1,6 +1,36 @@
 # ferrokey
 Cross-platform remote mouse and keyboard control (Linux Wayland + Windows), written in Rust
 
+## Running the server
+
+```sh
+cargo run --release -p ferrokey-server
+```
+
+The server listens on TCP port 47800 (`--listen` to change). On first run, or
+with `--pair`, it prints a six-digit pairing code; enter it in the app along
+with the computer's address. The code works once, and pairing closes after
+three wrong attempts. `--print-events` prints received events instead of
+injecting them, which is handy for testing the app.
+
+The server's key and the list of paired devices live in
+`$XDG_CONFIG_HOME/ferrokey` (`%APPDATA%\ferrokey` on Windows). Delete a line
+from `devices` and restart the server to unpair a phone.
+
+## Security
+
+All traffic is encrypted and authenticated with the
+[Noise protocol](https://noiseprotocol.org) (`XX` handshake, X25519,
+ChaCha20-Poly1305, BLAKE2s). Each side has a long-term key: the server only
+accepts phones it has paired with, and the phone refuses a server whose key
+changed since pairing.
+
+Pairing runs [SPAKE2](https://datatracker.ietf.org/doc/rfc9382/) with the
+pairing code and feeds the result into the Noise handshake as a pre-shared
+key. Someone watching the network can't test guesses offline, and someone
+actively attacking gets one guess per attempt (three in total). The protocol
+is described in `crates/ferrokey-net/src/lib.rs`.
+
 ## Linux
 
 Input is injected through the xdg-desktop-portal
@@ -45,5 +75,6 @@ cd android
 ./gradlew assembleDebug
 ```
 
-The app currently shows a touchpad and left/right buttons; there's no
-networking yet, so events are only counted.
+The app pairs with and connects to a server, then shows a touchpad
+(drag to move, tap to click) and left/right buttons. Servers are entered by
+address for now; there's no automatic discovery yet.

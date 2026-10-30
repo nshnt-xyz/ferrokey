@@ -11,6 +11,7 @@ repository = "https://github.com/nshnt-xyz/ferrokey"
 [workspace.dependencies]
 ferrokey-protocol = { path = "crates/ferrokey-protocol" }
 ferrokey-input = { path = "crates/ferrokey-input" }
+ferrokey-net = { path = "crates/ferrokey-net" }
 uniffi = "0.32"
 
 [workspace.lints.rust]

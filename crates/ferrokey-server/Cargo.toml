@@ -8,6 +8,8 @@ repository.workspace = true
 [dependencies]
 ferrokey-protocol.workspace = true
 ferrokey-input.workspace = true
+ferrokey-net.workspace = true
+getrandom = "0.4"
 
 [lints]
 workspace = true

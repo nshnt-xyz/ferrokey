@@ -13,24 +13,27 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
-import xyz.nshnt.ferrokey.core.Client
+import androidx.lifecycle.viewmodel.compose.viewModel
 
 class MainActivity : ComponentActivity() {
-    private val client = Client()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             FerrokeyTheme {
-                TouchpadScreen(client)
+                FerrokeyApp(viewModel())
             }
         }
     }
+}
 
-    override fun onDestroy() {
-        client.close()
-        super.onDestroy()
+@Composable
+private fun FerrokeyApp(model: ClientViewModel) {
+    val address = model.connectedTo
+    if (address == null) {
+        ConnectScreen(model)
+    } else {
+        TouchpadScreen(address, send = model::send, onDisconnect = { model.disconnect() })
     }
 }
 

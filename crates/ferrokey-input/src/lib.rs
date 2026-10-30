@@ -8,7 +8,7 @@ mod portal;
 mod windows;
 
 /// Injects input events into the local desktop session.
-pub trait InputBackend {
+pub trait InputBackend: Send {
     fn inject(&mut self, event: InputEvent) -> Result<(), Error>;
 }
 

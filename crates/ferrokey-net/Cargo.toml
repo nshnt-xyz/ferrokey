@@ -1,0 +1,17 @@
+[package]
+name = "ferrokey-net"
+description = "Pairing, encryption and framing for the ferrokey client/server link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrokey-protocol.workspace = true
+getrandom = "0.4"
+snow = "0.10"
+spake2 = "0.4"
+thiserror = "2"
+
+[lints]
+workspace = true

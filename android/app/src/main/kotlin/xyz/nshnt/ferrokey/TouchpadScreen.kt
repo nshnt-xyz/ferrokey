@@ -16,29 +16,20 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
-import xyz.nshnt.ferrokey.core.Client
 import xyz.nshnt.ferrokey.core.InputEvent
 import xyz.nshnt.ferrokey.core.MouseButton
 import kotlin.math.roundToInt
 
-/** A touchpad surface plus left/right buttons, sending events to [client]. */
+/** A touchpad surface plus left/right buttons, connected to [address]. */
 @Composable
-fun TouchpadScreen(client: Client) {
-    var eventsSent by remember { mutableLongStateOf(0L) }
-    val send = { event: InputEvent ->
-        client.send(event)
-        eventsSent = client.eventsSent().toLong()
-    }
+fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: () -> Unit) {
     val click = { button: MouseButton ->
         send(InputEvent.MouseButton(button, pressed = true))
         send(InputEvent.MouseButton(button, pressed = false))
@@ -49,10 +40,14 @@ fun TouchpadScreen(client: Client) {
             modifier = Modifier.safeDrawingPadding().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text(
-                text = "Not connected · $eventsSent events",
-                style = MaterialTheme.typography.titleMedium,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "Connected to $address",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onDisconnect) { Text("Disconnect") }
+            }
             Box(
                 modifier = Modifier
                     .weight(1f)
