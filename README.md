@@ -85,7 +85,9 @@ rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk
 ```
 
-plus the Android SDK (`ANDROID_HOME` or `android/local.properties`). The NDK
+plus a JDK (17 or newer, with `javac`; on Debian/Ubuntu `openjdk-21-jdk`, not
+just the `-jre`) and the Android SDK (`ANDROID_HOME` or
+`android/local.properties`). The NDK
 version pinned in `app/build.gradle.kts` is installed by Gradle if missing.
 
 ```sh

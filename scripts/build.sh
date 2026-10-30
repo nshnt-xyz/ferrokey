@@ -12,6 +12,18 @@ for target in aarch64-linux-android x86_64-linux-android; do
     grep -qx "$target" <<<"$installed_targets" \
         || die "Rust target $target missing; run: rustup target add aarch64-linux-android x86_64-linux-android"
 done
+# Gradle compiles with the JDK it runs on, so a runtime-only install fails
+# deep inside the build. Catch it here instead.
+if [[ -n ${JAVA_HOME:-} ]]; then
+    java_home="$JAVA_HOME"
+else
+    java="$(command -v java)" || die "Java not found; install a JDK, e.g.: sudo apt install openjdk-21-jdk"
+    java_home="$(dirname "$(dirname "$(readlink -f "$java")")")"
+fi
+if [[ ! -x $java_home/bin/javac ]]; then
+    version="$(basename "$java_home" | grep -oE '[0-9]+' | head -1)"
+    die "$java_home is a Java runtime without a compiler; install the JDK, e.g.: sudo apt install openjdk-${version:-21}-jdk"
+fi
 sdk="$(find_sdk)" || die "Android SDK not found; set ANDROID_HOME or sdk.dir in android/local.properties"
 export ANDROID_HOME="$sdk"
 
