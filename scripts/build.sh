@@ -27,6 +27,19 @@ fi
 sdk="$(find_sdk)" || die "Android SDK not found; set ANDROID_HOME or sdk.dir in android/local.properties"
 export ANDROID_HOME="$sdk"
 
+# Gradle doesn't download the NDK for us, since the Rust build (not Gradle)
+# is what uses it. Install the version the app pins if it's missing.
+ndk_version="$(sed -n 's/^ *ndkVersion = "\(.*\)"/\1/p' "$ROOT/android/app/build.gradle.kts")"
+[[ -n $ndk_version ]] || die "could not read ndkVersion from android/app/build.gradle.kts"
+if [[ ! -d $sdk/ndk/$ndk_version ]]; then
+    sdkmanager="$(command -v sdkmanager || true)"
+    [[ -n $sdkmanager ]] || sdkmanager="$(ls "$sdk"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1 || true)"
+    [[ -x $sdkmanager ]] \
+        || die "NDK $ndk_version is not installed and sdkmanager wasn't found. Install it from Android Studio (SDK Manager > SDK Tools > NDK (Side by side), tick \"Show Package Details\"), or install the \"Android SDK Command-line Tools\" there and rerun"
+    say "Installing NDK $ndk_version"
+    "$sdkmanager" --sdk_root="$sdk" "ndk;$ndk_version"
+fi
+
 say "Building server and client"
 cargo build --release --manifest-path "$ROOT/Cargo.toml" -p ferrokey-server -p ferrokey-client
 

@@ -87,8 +87,10 @@ cargo install cargo-ndk
 
 plus a JDK (17 or newer, with `javac`; on Debian/Ubuntu `openjdk-21-jdk`, not
 just the `-jre`) and the Android SDK (`ANDROID_HOME` or
-`android/local.properties`). The NDK
-version pinned in `app/build.gradle.kts` is installed by Gradle if missing.
+`android/local.properties`). `scripts/build.sh` installs the NDK version
+pinned in `app/build.gradle.kts` if it's missing, using the SDK's
+`sdkmanager` (Android Studio: SDK Manager > SDK Tools > Android SDK
+Command-line Tools).
 
 ```sh
 cd android
