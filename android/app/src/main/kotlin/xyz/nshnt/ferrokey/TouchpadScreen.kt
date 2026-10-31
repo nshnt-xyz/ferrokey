@@ -25,13 +25,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.dp
 import xyz.nshnt.ferrokey.core.InputEvent
 import xyz.nshnt.ferrokey.core.MouseButton
@@ -44,7 +42,6 @@ fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: ()
         send(InputEvent.MouseButton(button, pressed = true))
         send(InputEvent.MouseButton(button, pressed = false))
     }
-    val haptics = LocalHapticFeedback.current
     var holding by remember { mutableStateOf(false) }
 
     Surface(modifier = Modifier.fillMaxSize()) {
@@ -74,7 +71,6 @@ fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: ()
                         touchpadGestures(
                             onTap = { click(MouseButton.LEFT) },
                             onHoldStart = {
-                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                                 holding = true
                                 send(InputEvent.MouseButton(MouseButton.LEFT, pressed = true))
                             },
@@ -115,12 +111,13 @@ fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: ()
     }
 }
 
-private enum class Start { Tap, Drag, Hold }
-
 /**
- * Touchpad gestures: a quick tap calls [onTap]; moving a finger calls [onMove];
- * touching and holding still for the long-press timeout calls [onHoldStart],
- * after which moving drags and lifting the finger calls [onHoldEnd].
+ * Touchpad gestures. Moving a finger past the touch slop calls [onMove];
+ * lifting it without moving calls [onTap]. Touching again within the
+ * double-tap timeout of a tap (tap and a half) calls [onHoldStart] right
+ * away and [onHoldEnd] when that finger lifts, so moving in between drags.
+ * A quick tap in hold mode presses and releases, so tapping twice still
+ * double-clicks, and three times triple-clicks.
  */
 private suspend fun PointerInputScope.touchpadGestures(
     onTap: () -> Unit,
@@ -128,55 +125,62 @@ private suspend fun PointerInputScope.touchpadGestures(
     onHoldEnd: () -> Unit,
     onMove: (Offset) -> Unit,
     onGestureEnd: () -> Unit,
-) = awaitEachGesture {
-    var pointer = awaitFirstDown(requireUnconsumed = false).id
-    var travelled = Offset.Zero
+) {
+    // When the last gesture that didn't move ended, or null if the last one moved.
+    var lastTapUp: Long? = null
 
-    // Returns the tracked pointer's change, switching to another finger if it
-    // lifts while others are still down, or null once every finger is up.
-    fun track(changes: List<PointerInputChange>): PointerInputChange? {
-        val change = changes.firstOrNull { it.id == pointer } ?: return null
-        if (!change.changedToUp()) return change
-        val next = changes.firstOrNull { it.pressed } ?: return null
-        pointer = next.id
-        return next
-    }
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val tapUp = lastTapUp
+        val held = tapUp != null && down.uptimeMillis - tapUp <= viewConfiguration.doubleTapTimeoutMillis
+        lastTapUp = null
 
-    // Decide what this gesture is: lifted before the timeout (tap), moved past
-    // the touch slop (drag), or neither (hold).
-    val start = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
-        var decided: Start? = null
-        while (decided == null) {
-            val change = track(awaitPointerEvent().changes)
-            if (change == null) {
-                decided = Start.Tap
-            } else {
-                travelled += change.positionChange()
-                if (travelled.getDistance() > viewConfiguration.touchSlop) {
+        var pointer = down.id
+        var travelled = Offset.Zero
+        var moving = false
+        var upTime: Long? = null
+
+        if (held) onHoldStart()
+        try {
+            while (true) {
+                val changes = awaitPointerEvent().changes
+                val tracked = changes.firstOrNull { it.id == pointer } ?: break
+                val change = if (tracked.changedToUp()) {
+                    // Follow another finger if one is still down.
+                    val next = changes.firstOrNull { it.pressed }
+                    if (next == null) {
+                        upTime = tracked.uptimeMillis
+                        break
+                    }
+                    pointer = next.id
+                    next
+                } else {
+                    tracked
+                }
+
+                val delta = change.positionChange()
+                if (moving) {
                     change.consume()
-                    decided = Start.Drag
+                    if (delta != Offset.Zero) onMove(delta)
+                } else {
+                    travelled += delta
+                    if (travelled.getDistance() > viewConfiguration.touchSlop) {
+                        moving = true
+                        change.consume()
+                        onMove(travelled)
+                    }
                 }
             }
+        } finally {
+            // Also runs if the gesture is cancelled, so a held button never sticks.
+            if (held) onHoldEnd()
+            onGestureEnd()
         }
-        decided
-    } ?: Start.Hold
 
-    if (start == Start.Tap) {
-        onTap()
-        return@awaitEachGesture
-    }
-
-    if (start == Start.Hold) onHoldStart() else onMove(travelled)
-    try {
-        while (true) {
-            val change = track(awaitPointerEvent().changes) ?: break
-            val delta = change.positionChange()
-            change.consume()
-            if (delta != Offset.Zero) onMove(delta)
+        val up = upTime
+        if (!moving && up != null) {
+            if (!held) onTap()
+            lastTapUp = up
         }
-    } finally {
-        // Also runs if the gesture is cancelled, so a held button never sticks.
-        if (start == Start.Hold) onHoldEnd()
-        onGestureEnd()
     }
 }
