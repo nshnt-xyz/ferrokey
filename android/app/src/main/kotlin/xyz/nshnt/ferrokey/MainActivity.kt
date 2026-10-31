@@ -33,7 +33,13 @@ private fun FerrokeyApp(model: ClientViewModel) {
     if (address == null) {
         ConnectScreen(model)
     } else {
-        TouchpadScreen(address, send = model::send, onDisconnect = { model.disconnect() })
+        TouchpadScreen(
+            address,
+            send = model::send,
+            typeText = model::typeText,
+            tapKey = model::tapKey,
+            onDisconnect = { model.disconnect() },
+        )
     }
 }
 

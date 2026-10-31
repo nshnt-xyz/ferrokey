@@ -49,6 +49,19 @@ key. Someone watching the network can't test guesses offline, and someone
 actively attacking gets one guess per attempt (three in total). The protocol
 is described in `crates/ferrokey-net/src/lib.rs`.
 
+## Keyboard
+
+Tap **Keyboard** in the app to bring up the phone's keyboard; what you type is
+sent to the computer as key presses. A row above the keyboard has Esc, Tab,
+arrows, Home/End, Page Up/Down, Delete, F1–F12 and Ctrl/Alt/Shift/Super
+toggles. A toggled modifier applies to the next key, so Ctrl then `c` sends
+Ctrl+C.
+
+Keys are sent as physical key positions, so the computer's keyboard layout
+decides what they type. The app assumes a US QWERTY layout; on other layouts
+some characters come out differently, and characters a US keyboard can't type
+(such as accented letters) are skipped.
+
 ## Linux
 
 Input is injected through the xdg-desktop-portal

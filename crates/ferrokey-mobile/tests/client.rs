@@ -8,6 +8,7 @@ use ferrokey_mobile::{Client, ClientError};
 use ferrokey_net::server::{self, Authorizer};
 use ferrokey_net::{Keypair, PublicKey};
 use ferrokey_protocol::InputEvent;
+use ferrokey_protocol::keys::{KEY_ENTER, KEY_LEFTCTRL, KEY_LEFTSHIFT, Modifiers, SpecialKey};
 
 struct Auth {
     code: String,
@@ -49,7 +50,11 @@ fn pairs_persists_and_reconnects() {
         for _ in 0..2 {
             let (stream, _) = listener.accept().unwrap();
             let mut session = server::accept(stream, &server_key, &auth).unwrap();
-            received.extend(session.recv_events().unwrap());
+            // Events can arrive split over several messages; read until the
+            // client disconnects.
+            while let Ok(events) = session.recv_events() {
+                received.extend(events);
+            }
         }
         received
     });
@@ -71,21 +76,30 @@ fn pairs_persists_and_reconnects() {
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0].address, address);
     client.connect(address).unwrap();
-    client
-        .send(InputEvent::Key {
-            code: 30,
-            pressed: true,
-        })
-        .unwrap();
+    assert_eq!(
+        client.type_text("A€".into(), Modifiers::default()).unwrap(),
+        1
+    );
+    let ctrl = Modifiers {
+        ctrl: true,
+        ..Modifiers::default()
+    };
+    client.tap_key(SpecialKey::Enter, ctrl).unwrap();
+    client.disconnect();
 
+    let key = |code, pressed| InputEvent::Key { code, pressed };
     assert_eq!(
         server.join().unwrap(),
         [
             InputEvent::MouseMove { dx: 1, dy: 2 },
-            InputEvent::Key {
-                code: 30,
-                pressed: true
-            }
+            key(KEY_LEFTSHIFT, true),
+            key(30, true),
+            key(30, false),
+            key(KEY_LEFTSHIFT, false),
+            key(KEY_LEFTCTRL, true),
+            key(KEY_ENTER, true),
+            key(KEY_ENTER, false),
+            key(KEY_LEFTCTRL, false),
         ]
     );
     std::fs::remove_dir_all(&data_dir).unwrap();

@@ -6,9 +6,12 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -18,22 +21,58 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
 import xyz.nshnt.ferrokey.core.InputEvent
+import xyz.nshnt.ferrokey.core.Modifiers
 import xyz.nshnt.ferrokey.core.MouseButton
+import xyz.nshnt.ferrokey.core.SpecialKey
 import kotlin.math.roundToInt
 
-/** A touchpad surface plus left/right buttons, connected to [address]. */
+/**
+ * A touchpad surface plus left/right buttons, connected to [address]. The
+ * keyboard button brings up the soft keyboard, whose typing goes to the
+ * computer, along with a row of keys it lacks.
+ */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: () -> Unit) {
+fun TouchpadScreen(
+    address: String,
+    send: (InputEvent) -> Unit,
+    typeText: (String, Modifiers) -> Unit,
+    tapKey: (SpecialKey, Modifiers) -> Unit,
+    onDisconnect: () -> Unit,
+) {
     val click = { button: MouseButton ->
         send(InputEvent.MouseButton(button, pressed = true))
         send(InputEvent.MouseButton(button, pressed = false))
     }
+
+    // Modifiers from the key bar apply to the next key only.
+    var modifiers by remember { mutableStateOf(NoModifiers) }
+    val type = { text: String ->
+        typeText(text, modifiers)
+        modifiers = NoModifiers
+    }
+    val tap = { key: SpecialKey ->
+        tapKey(key, modifiers)
+        modifiers = NoModifiers
+    }
+
+    val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val keyboardVisible = WindowInsets.isImeVisible
 
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -47,6 +86,11 @@ fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: ()
                     modifier = Modifier.weight(1f),
                 )
                 TextButton(onClick = onDisconnect) { Text("Disconnect") }
+                KeyboardCapture(
+                    focusRequester,
+                    onText = type,
+                    onBackspace = { tap(SpecialKey.BACKSPACE) },
+                )
             }
             Box(
                 modifier = Modifier
@@ -85,6 +129,28 @@ fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: ()
                 FilledTonalButton(onClick = { click(MouseButton.RIGHT) }, modifier = Modifier.weight(1f)) {
                     Text("Right")
                 }
+                FilledTonalButton(
+                    onClick = {
+                        if (keyboardVisible) {
+                            keyboardController?.hide()
+                            focusManager.clearFocus()
+                        } else {
+                            focusRequester.requestFocus()
+                            keyboardController?.show()
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Keyboard")
+                }
+            }
+            if (keyboardVisible) {
+                SpecialKeyBar(
+                    modifiers,
+                    onModifiersChange = { modifiers = it },
+                    onKey = tap,
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
         }
     }

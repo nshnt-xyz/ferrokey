@@ -14,7 +14,9 @@ import kotlinx.coroutines.withContext
 import xyz.nshnt.ferrokey.core.Client
 import xyz.nshnt.ferrokey.core.ClientException
 import xyz.nshnt.ferrokey.core.InputEvent
+import xyz.nshnt.ferrokey.core.Modifiers
 import xyz.nshnt.ferrokey.core.PairedServer
+import xyz.nshnt.ferrokey.core.SpecialKey
 import java.io.File
 
 /**
@@ -68,9 +70,16 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         error = message
     }
 
-    fun send(event: InputEvent) {
+    fun send(event: InputEvent) = sending { client.send(event) }
+
+    /** Types [text], skipping characters a US keyboard layout can't type. */
+    fun typeText(text: String, modifiers: Modifiers) = sending { client.typeText(text, modifiers) }
+
+    fun tapKey(key: SpecialKey, modifiers: Modifiers) = sending { client.tapKey(key, modifiers) }
+
+    private inline fun sending(block: () -> Unit) {
         try {
-            client.send(event)
+            block()
         } catch (e: ClientException) {
             disconnect("Connection lost")
         }
