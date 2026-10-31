@@ -25,7 +25,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
@@ -112,12 +113,16 @@ fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: ()
 }
 
 /**
- * Touchpad gestures. Moving a finger past the touch slop calls [onMove];
- * lifting it without moving calls [onTap]. Touching again within the
- * double-tap timeout of a tap (tap and a half) calls [onHoldStart] right
- * away and [onHoldEnd] when that finger lifts, so moving in between drags.
- * A quick tap in hold mode presses and releases, so tapping twice still
- * double-clicks, and three times triple-clicks.
+ * Touchpad gestures, like a laptop touchpad. Moving a finger calls [onMove]
+ * as it moves. Lifting it without moving past the touch slop is a tap, but
+ * [onTap] waits out the double-tap timeout first: touching again within it
+ * (tap and a half) calls [onHoldStart] instead, and [onHoldEnd] when that
+ * finger lifts, so moving in between drags. If the second touch doesn't move
+ * past the slop either, it was a double tap, and [onTap] is called once more
+ * to make it a double click.
+ *
+ * Holding the first click back keeps the drag's press from arriving right
+ * after a click, which the computer would take as a double click.
  */
 private suspend fun PointerInputScope.touchpadGestures(
     onTap: () -> Unit,
@@ -125,62 +130,62 @@ private suspend fun PointerInputScope.touchpadGestures(
     onHoldEnd: () -> Unit,
     onMove: (Offset) -> Unit,
     onGestureEnd: () -> Unit,
-) {
-    // When the last gesture that didn't move ended, or null if the last one moved.
-    var lastTapUp: Long? = null
+) = awaitEachGesture {
+    val first = awaitFirstDown(requireUnconsumed = false)
+    val moved = try {
+        followTouch(first.id, onMove)
+    } finally {
+        onGestureEnd()
+    }
+    if (moved) return@awaitEachGesture
 
-    awaitEachGesture {
-        val down = awaitFirstDown(requireUnconsumed = false)
-        val tapUp = lastTapUp
-        val held = tapUp != null && down.uptimeMillis - tapUp <= viewConfiguration.doubleTapTimeoutMillis
-        lastTapUp = null
+    val second = withTimeoutOrNull(viewConfiguration.doubleTapTimeoutMillis) {
+        awaitFirstDown(requireUnconsumed = false)
+    }
+    if (second == null) {
+        onTap()
+        return@awaitEachGesture
+    }
 
-        var pointer = down.id
-        var travelled = Offset.Zero
-        var moving = false
-        var upTime: Long? = null
+    onHoldStart()
+    val dragged = try {
+        followTouch(second.id, onMove)
+    } finally {
+        // Also runs if the gesture is cancelled, so a held button never sticks.
+        onHoldEnd()
+        onGestureEnd()
+    }
+    if (!dragged) onTap()
+}
 
-        if (held) onHoldStart()
-        try {
-            while (true) {
-                val changes = awaitPointerEvent().changes
-                val tracked = changes.firstOrNull { it.id == pointer } ?: break
-                val change = if (tracked.changedToUp()) {
-                    // Follow another finger if one is still down.
-                    val next = changes.firstOrNull { it.pressed }
-                    if (next == null) {
-                        upTime = tracked.uptimeMillis
-                        break
-                    }
-                    pointer = next.id
-                    next
-                } else {
-                    tracked
-                }
-
-                val delta = change.positionChange()
-                if (moving) {
-                    change.consume()
-                    if (delta != Offset.Zero) onMove(delta)
-                } else {
-                    travelled += delta
-                    if (travelled.getDistance() > viewConfiguration.touchSlop) {
-                        moving = true
-                        change.consume()
-                        onMove(travelled)
-                    }
-                }
-            }
-        } finally {
-            // Also runs if the gesture is cancelled, so a held button never sticks.
-            if (held) onHoldEnd()
-            onGestureEnd()
+/**
+ * Follows a touch until every finger lifts, switching to another finger if
+ * [pointer] lifts first, and passes all its movement to [onMove] as it
+ * happens. Returns whether it moved past the touch slop, i.e. wasn't a tap.
+ */
+private suspend fun AwaitPointerEventScope.followTouch(
+    pointer: PointerId,
+    onMove: (Offset) -> Unit,
+): Boolean {
+    var tracking = pointer
+    var travelled = Offset.Zero
+    var moved = false
+    while (true) {
+        val changes = awaitPointerEvent().changes
+        var change = changes.firstOrNull { it.id == tracking } ?: return moved
+        if (change.changedToUp()) {
+            change = changes.firstOrNull { it.pressed } ?: return moved
+            tracking = change.id
         }
 
-        val up = upTime
-        if (!moving && up != null) {
-            if (!held) onTap()
-            lastTapUp = up
+        // Move right away rather than after the slop, so drags don't lag;
+        // the few pixels a tap wobbles don't matter.
+        val delta = change.positionChange()
+        change.consume()
+        if (delta != Offset.Zero) onMove(delta)
+        if (!moved) {
+            travelled += delta
+            moved = travelled.getDistance() > viewConfiguration.touchSlop
         }
     }
 }
