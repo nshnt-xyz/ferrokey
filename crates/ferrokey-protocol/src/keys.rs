@@ -1,8 +1,17 @@
-//! Turning text and named keys into [`InputEvent::Key`] sequences.
+//! Turning text and named keys into key event sequences.
 //!
-//! Key events carry Linux evdev keycodes, which name physical key positions,
-//! not characters. The server's keyboard layout decides what a position
-//! types, so [`char_key`] assumes the computer uses a US QWERTY layout.
+//! [`InputEvent::Key`] carries a Linux evdev keycode, which names a physical
+//! key position, not a character: the computer's keyboard layout decides
+//! what it types. Named keys and modifiers are sent that way.
+//!
+//! Text is sent as [`InputEvent::Keysym`]s instead, which name the character,
+//! and the computer works out which key types it on its active layout. So
+//! text comes out right on AZERTY or any other layout, and accented letters
+//! or symbols like `€` type wherever the layout has them. A character the
+//! active layout lacks may still be dropped, depending on the compositor.
+//!
+//! [`char_key`] maps characters to US QWERTY keycodes, for backends that can
+//! only send keycodes.
 
 use crate::InputEvent;
 
@@ -170,49 +179,94 @@ pub fn char_key(c: char) -> Option<(u32, bool)> {
     Some(key)
 }
 
-/// Appends the events that tap `code` while holding `modifiers`.
-pub fn tap(code: u32, modifiers: Modifiers, out: &mut Vec<InputEvent>) {
+// XKB keysyms, from xkbcommon-keysyms.h.
+const XKB_KEY_TAB: u32 = 0xff09;
+const XKB_KEY_RETURN: u32 = 0xff0d;
+/// Keysyms for Unicode characters are the code point plus this offset.
+const XKB_KEYSYM_UNICODE_OFFSET: u32 = 0x0100_0000;
+
+/// The keysym for the character `c`, or `None` for control characters
+/// (Enter and Tab are sent as keycodes; see [`char_key`]).
+pub fn char_keysym(c: char) -> Option<u32> {
+    match c {
+        c if c.is_control() => None,
+        // Printable Latin-1 keysyms equal their code point.
+        ' '..='~' | '\u{a0}'..='\u{ff}' => Some(c as u32),
+        c => Some(c as u32 + XKB_KEYSYM_UNICODE_OFFSET),
+    }
+}
+
+/// The character a keysym types, if it types one.
+pub fn keysym_char(keysym: u32) -> Option<char> {
+    match keysym {
+        0x20..=0x7e | 0xa0..=0xff => char::from_u32(keysym),
+        XKB_KEY_TAB => Some('\t'),
+        XKB_KEY_RETURN => Some('\n'),
+        // 0x100 and up; lower code points use their Latin-1 keysyms.
+        0x0100_0100..=0x0110_ffff => char::from_u32(keysym - XKB_KEYSYM_UNICODE_OFFSET),
+        _ => None,
+    }
+}
+
+/// Appends `press` and `release` with `modifiers` held around them.
+fn tap_with(
+    modifiers: Modifiers,
+    press: InputEvent,
+    release: InputEvent,
+    out: &mut Vec<InputEvent>,
+) {
     out.extend(modifiers.codes().map(|code| InputEvent::Key {
         code,
         pressed: true,
     }));
-    out.push(InputEvent::Key {
-        code,
-        pressed: true,
-    });
-    out.push(InputEvent::Key {
-        code,
-        pressed: false,
-    });
+    out.extend([press, release]);
     out.extend(modifiers.codes().rev().map(|code| InputEvent::Key {
         code,
         pressed: false,
     }));
 }
 
+/// Appends the events that tap `code` while holding `modifiers`.
+pub fn tap(code: u32, modifiers: Modifiers, out: &mut Vec<InputEvent>) {
+    let key = |pressed| InputEvent::Key { code, pressed };
+    tap_with(modifiers, key(true), key(false), out);
+}
+
+/// Appends the events that tap `keysym` while holding `modifiers`.
+pub fn tap_keysym(keysym: u32, modifiers: Modifiers, out: &mut Vec<InputEvent>) {
+    let key = |pressed| InputEvent::Keysym { keysym, pressed };
+    tap_with(modifiers, key(true), key(false), out);
+}
+
 /// Appends the events that type `text` while holding `modifiers`, and
-/// returns how many characters were skipped because no key types them.
+/// returns how many characters were skipped because nothing types them
+/// (control characters other than newline and tab).
+///
+/// Printable characters are sent as keysyms, so they type on whatever
+/// layout the computer uses; newline and tab are sent as the Enter and Tab
+/// keys.
 pub fn type_text(text: &str, modifiers: Modifiers, out: &mut Vec<InputEvent>) -> usize {
     let mut skipped = 0;
     for c in text.chars() {
-        match char_key(c) {
-            Some((code, shift)) => {
-                let modifiers = Modifiers {
-                    shift: modifiers.shift || shift,
-                    ..modifiers
-                };
-                tap(code, modifiers, out);
-            }
-            None => skipped += 1,
+        if let Some(keysym) = char_keysym(c) {
+            tap_keysym(keysym, modifiers, out);
+        } else if let Some((code, false)) = char_key(c) {
+            tap(code, modifiers, out);
+        } else {
+            skipped += 1;
         }
     }
     skipped
 }
 
+fn typable(c: char) -> bool {
+    char_keysym(c).is_some() || c == '\n' || c == '\t'
+}
+
 /// How many characters of `text` [`type_text`] types, which is how many
 /// backspaces it takes to erase them again.
 pub fn typable_len(text: &str) -> usize {
-    text.chars().filter(|&c| char_key(c).is_some()).count()
+    text.chars().filter(|&c| typable(c)).count()
 }
 
 #[cfg(test)]
@@ -234,22 +288,45 @@ mod tests {
         assert_eq!(char_key('\n'), Some((KEY_ENTER, false)));
         assert_eq!(char_key('é'), None);
         assert_eq!(SpecialKey::F10.code(), 68);
-        assert_eq!(typable_len("aé😀b"), 2);
     }
 
     #[test]
-    fn types_with_shift_and_modifiers() {
+    fn maps_characters_to_keysyms_and_back() {
+        for (c, keysym) in [
+            ('a', 0x61),
+            ('A', 0x41),
+            (' ', 0x20),
+            ('é', 0xe9),
+            ('\u{a0}', 0xa0),
+            ('€', 0x0100_20ac),
+            ('😀', 0x0101_f600),
+        ] {
+            assert_eq!(char_keysym(c), Some(keysym), "{c:?}");
+            assert_eq!(keysym_char(keysym), Some(c), "{keysym:#x}");
+        }
+        assert_eq!(char_keysym('\n'), None);
+        assert_eq!(char_keysym('\u{7f}'), None);
+        assert_eq!(keysym_char(XKB_KEY_RETURN), Some('\n'));
+        // Latin-1 characters only have their legacy keysym.
+        assert_eq!(keysym_char(0x0100_00e9), None);
+        assert_eq!(keysym_char(0xff1b), None); // Escape
+        assert_eq!(typable_len("aé😀\nb\u{7}"), 5);
+    }
+
+    #[test]
+    fn types_keysyms_with_modifiers() {
+        let keysym = |keysym, pressed| InputEvent::Keysym { keysym, pressed };
         let mut out = Vec::new();
-        assert_eq!(type_text("hI", Modifiers::default(), &mut out), 0);
+        assert_eq!(type_text("hI\n", Modifiers::default(), &mut out), 0);
         assert_eq!(
             out,
             [
-                key(35, true),
-                key(35, false),
-                key(KEY_LEFTSHIFT, true),
-                key(23, true),
-                key(23, false),
-                key(KEY_LEFTSHIFT, false),
+                keysym(0x68, true),
+                keysym(0x68, false),
+                keysym(0x49, true),
+                keysym(0x49, false),
+                key(KEY_ENTER, true),
+                key(KEY_ENTER, false),
             ]
         );
 
@@ -259,14 +336,14 @@ mod tests {
             shift: true,
             ..Modifiers::default()
         };
-        assert_eq!(type_text("t€", ctrl_shift, &mut out), 1);
+        assert_eq!(type_text("€\u{7}", ctrl_shift, &mut out), 1);
         assert_eq!(
             out,
             [
                 key(KEY_LEFTCTRL, true),
                 key(KEY_LEFTSHIFT, true),
-                key(20, true),
-                key(20, false),
+                keysym(0x0100_20ac, true),
+                keysym(0x0100_20ac, false),
                 key(KEY_LEFTSHIFT, false),
                 key(KEY_LEFTCTRL, false),
             ]

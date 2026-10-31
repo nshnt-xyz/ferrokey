@@ -36,7 +36,8 @@ The server listens on TCP port 47800 (`--listen` to change). On first run, or
 with `--pair`, it prints a six-digit pairing code; enter it in the app along
 with the computer's address. The code works once, and pairing closes after
 three wrong attempts. `--print-events` prints received events instead of
-injecting them, which is handy for testing the app.
+injecting them, which is handy for testing the app. `--screen` and `--eis`
+are described under [Linux](#linux).
 
 The server's key and the list of paired devices live in
 `$XDG_CONFIG_HOME/ferrokey` (`%APPDATA%\ferrokey` on Windows). Delete a line
@@ -64,10 +65,12 @@ arrows, Home/End, Page Up/Down, Delete, F1–F12 and Ctrl/Alt/Shift/Super
 toggles. A toggled modifier applies to the next key, so Ctrl then `c` sends
 Ctrl+C.
 
-Keys are sent as physical key positions, so the computer's keyboard layout
-decides what they type. The app assumes a US QWERTY layout; on other layouts
-some characters come out differently, and characters a US keyboard can't type
-(such as accented letters) are skipped.
+Typed text is sent as keysyms, which name the character rather than the key,
+and the computer works out which key types it on its active layout. So text
+comes out right on AZERTY, QWERTZ and other layouts, and characters like `é`
+or `€` type wherever the active layout has them. A character the layout lacks
+may still be dropped, depending on the compositor. Named keys (arrows, F1–F12,
+the modifiers, ...) are sent as physical key positions.
 
 ## Linux
 
@@ -76,6 +79,24 @@ Input is injected through the xdg-desktop-portal
 interface, which is supported on GNOME and KDE Plasma. The first run shows a
 permission dialog; the restore token it returns is saved to
 `$XDG_STATE_HOME/ferrokey/portal-restore-token` so later runs skip it.
+
+Besides relative motion, buttons, wheel scrolling and keys, the server can
+inject keysyms (see [Keyboard](#keyboard)), touchpad-style smooth scrolling
+with kinetic scrolling at the end of a gesture, absolute pointer positions
+and multi-touch. The app doesn't send the last three yet.
+
+- **`--screen`**: absolute pointer positions and touch need a shared screen,
+  since their positions are relative to it. With `--screen` the session
+  also shares your monitors through the ScreenCast portal (the dialog asks
+  which) and asks for a touchscreen device. The desktop shows this as screen
+  sharing, but nothing is recorded or sent anywhere. Positions on the wire
+  are fractions of the area covered by the shared monitors. Sessions with a
+  screen keep their own restore token, `portal-restore-token-screen`.
+- **`--eis`**: send input through [libei](https://libinput.pages.freedesktop.org/libei/)
+  over the portal's `ConnectToEIS` instead of one D-Bus call per event,
+  which has lower latency and overhead. It needs version 2 of the
+  RemoteDesktop portal. If the compositor's libei has no text input
+  (`ei_text`, libei 1.6), keysyms fall back to US QWERTY keys.
 
 ### Not yet supported: wlroots compositors
 

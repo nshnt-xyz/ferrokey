@@ -23,6 +23,11 @@ Options:
   --listen <ADDR>    Address to listen on [default: 0.0.0.0:47800]
   --pair             Show a pairing code so a new device can pair
   --print-events     Print events instead of injecting them
+  --screen           Share the screen with the input backend, so absolute
+                     pointer and touch input work (Linux: the desktop shows
+                     it as screen sharing)
+  --eis              Send input through libei instead of D-Bus calls (Linux,
+                     needs RemoteDesktop portal version 2)
   --state-dir <DIR>  Where the server key and paired devices are kept
   -h, --help         Print this help
 ";
@@ -31,6 +36,7 @@ struct Args {
     listen: SocketAddr,
     pair: bool,
     print_events: bool,
+    input: ferrokey_input::Options,
     state_dir: Option<PathBuf>,
 }
 
@@ -39,6 +45,7 @@ fn parse_args() -> Result<Args, String> {
         listen: SocketAddr::from(([0, 0, 0, 0], DEFAULT_PORT)),
         pair: false,
         print_events: false,
+        input: ferrokey_input::Options::default(),
         state_dir: None,
     };
     let mut iter = std::env::args().skip(1);
@@ -53,6 +60,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--pair" => args.pair = true,
             "--print-events" => args.print_events = true,
+            "--screen" => args.input.screen = true,
+            "--eis" => args.input.eis = true,
             "--state-dir" => args.state_dir = Some(value("--state-dir")?.into()),
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -92,7 +101,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let backend: Box<dyn InputBackend> = if args.print_events {
         Box::new(PrintBackend)
     } else {
-        ferrokey_input::backend()?
+        ferrokey_input::backend(args.input)?
     };
     let backend = Arc::new(Mutex::new(backend));
 
@@ -157,7 +166,8 @@ fn handle(
             }
         }
     };
-    // Don't leave a button or key stuck down if the client vanished mid-press.
+    // Don't leave a button, key or finger down if the client vanished
+    // mid-press.
     let mut backend = backend.lock().unwrap();
     for event in held.releases() {
         let _ = backend.inject(event);
@@ -170,11 +180,13 @@ fn handle(
     }
 }
 
-/// Buttons and keys a client currently holds down.
+/// Buttons, keys and fingers a client currently holds down.
 #[derive(Default)]
 struct Held {
     buttons: HashSet<MouseButton>,
     keys: HashSet<u32>,
+    keysyms: HashSet<u32>,
+    touches: HashSet<u32>,
 }
 
 impl Held {
@@ -204,7 +216,29 @@ impl Held {
             } => {
                 self.keys.remove(&code);
             }
-            InputEvent::MouseMove { .. } | InputEvent::Scroll { .. } => {}
+            InputEvent::Keysym {
+                keysym,
+                pressed: true,
+            } => {
+                self.keysyms.insert(keysym);
+            }
+            InputEvent::Keysym {
+                keysym,
+                pressed: false,
+            } => {
+                self.keysyms.remove(&keysym);
+            }
+            InputEvent::TouchDown { id, .. } => {
+                self.touches.insert(id);
+            }
+            InputEvent::TouchUp { id } => {
+                self.touches.remove(&id);
+            }
+            InputEvent::MouseMove { .. }
+            | InputEvent::Scroll { .. }
+            | InputEvent::SmoothScroll { .. }
+            | InputEvent::MoveTo { .. }
+            | InputEvent::TouchMove { .. } => {}
         }
     }
 
@@ -217,7 +251,12 @@ impl Held {
             code,
             pressed: false,
         });
-        buttons.chain(keys)
+        let keysyms = self.keysyms.iter().map(|&keysym| InputEvent::Keysym {
+            keysym,
+            pressed: false,
+        });
+        let touches = self.touches.iter().map(|&id| InputEvent::TouchUp { id });
+        buttons.chain(keys).chain(keysyms).chain(touches)
     }
 }
 

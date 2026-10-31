@@ -8,7 +8,7 @@ use ferrokey_mobile::{Client, ClientError};
 use ferrokey_net::server::{self, Authorizer};
 use ferrokey_net::{Keypair, PublicKey};
 use ferrokey_protocol::InputEvent;
-use ferrokey_protocol::keys::{KEY_ENTER, KEY_LEFTCTRL, KEY_LEFTSHIFT, Modifiers, SpecialKey};
+use ferrokey_protocol::keys::{KEY_ENTER, KEY_LEFTCTRL, Modifiers, SpecialKey};
 
 struct Auth {
     code: String,
@@ -77,7 +77,9 @@ fn pairs_persists_and_reconnects() {
     assert_eq!(servers[0].address, address);
     client.connect(address).unwrap();
     assert_eq!(
-        client.type_text("A€".into(), Modifiers::default()).unwrap(),
+        client
+            .type_text("A€\u{7}".into(), Modifiers::default())
+            .unwrap(),
         1
     );
     let ctrl = Modifiers {
@@ -88,14 +90,15 @@ fn pairs_persists_and_reconnects() {
     client.disconnect();
 
     let key = |code, pressed| InputEvent::Key { code, pressed };
+    let keysym = |keysym, pressed| InputEvent::Keysym { keysym, pressed };
     assert_eq!(
         server.join().unwrap(),
         [
             InputEvent::MouseMove { dx: 1, dy: 2 },
-            key(KEY_LEFTSHIFT, true),
-            key(30, true),
-            key(30, false),
-            key(KEY_LEFTSHIFT, false),
+            keysym(0x41, true),
+            keysym(0x41, false),
+            keysym(0x0100_20ac, true),
+            keysym(0x0100_20ac, false),
             key(KEY_LEFTCTRL, true),
             key(KEY_ENTER, true),
             key(KEY_ENTER, false),

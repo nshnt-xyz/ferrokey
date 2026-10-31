@@ -23,6 +23,12 @@ pub enum InputEvent {
     MouseButton { button: MouseButton, pressed: bool },
     Scroll { dx: i32, dy: i32 },
     Key { code: u32, pressed: bool },
+    Keysym { keysym: u32, pressed: bool },
+    SmoothScroll { dx: f32, dy: f32, finish: bool },
+    MoveTo { x: f32, y: f32 },
+    TouchDown { id: u32, x: f32, y: f32 },
+    TouchMove { id: u32, x: f32, y: f32 },
+    TouchUp { id: u32 },
 }
 
 #[uniffi::remote(Enum)]
@@ -199,9 +205,10 @@ impl Client {
         self.send_all([event])
     }
 
-    /// Types `text` as key presses, assuming the computer uses a US QWERTY
-    /// layout, while holding `modifiers`. Returns how many characters were
-    /// skipped because no key on that layout types them.
+    /// Types `text` while holding `modifiers`. Characters are sent as
+    /// keysyms, so the computer types them with its own keyboard layout.
+    /// Returns how many characters were skipped because nothing types them
+    /// (control characters other than newline and tab).
     pub fn type_text(&self, text: String, modifiers: Modifiers) -> Result<u32, ClientError> {
         let mut events = Vec::new();
         let skipped = keys::type_text(&text, modifiers, &mut events);

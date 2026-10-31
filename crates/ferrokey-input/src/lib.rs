@@ -48,10 +48,24 @@ impl std::error::Error for Error {
     }
 }
 
+/// Optional backend features. Platforms that don't need them ignore them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// Share the screen with the backend so it can place absolute pointer
+    /// and touch positions. On Linux this adds a ScreenCast stream to the
+    /// portal session, which the desktop shows as screen sharing.
+    pub screen: bool,
+    /// Send events through libei instead of one D-Bus call each (Linux,
+    /// RemoteDesktop portal version 2 and later).
+    pub eis: bool,
+}
+
 /// Returns the input backend for the current platform.
-pub fn backend() -> Result<Box<dyn InputBackend>, Error> {
+pub fn backend(options: Options) -> Result<Box<dyn InputBackend>, Error> {
     #[cfg(target_os = "linux")]
-    return Ok(Box::new(portal::PortalBackend::new()?));
+    return Ok(Box::new(portal::PortalBackend::new(options)?));
+    #[cfg(not(target_os = "linux"))]
+    let _ = options;
     #[cfg(target_os = "windows")]
     return Ok(Box::new(windows::WindowsBackend::new()?));
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

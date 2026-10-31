@@ -45,7 +45,7 @@ private fun sentinel() = TextFieldValue(SENTINEL, TextRange(SENTINEL.length))
  * Keyboards edit text rather than sending key presses, so each edit is
  * diffed against the previous text and reported to [onEdit] as a number of
  * backspaces followed by the text to type. Removed characters the computer
- * never received (ones a US layout can't type) don't count as backspaces.
+ * never received (control characters) don't count as backspaces.
  * Between words the field is reset to [SENTINEL] so it never grows; while
  * the keyboard is composing a word it's left alone, as resetting it would
  * break the keyboard's word suggestions.
@@ -69,9 +69,9 @@ fun KeyboardCapture(
         keyboardOptions = KeyboardOptions(
             capitalization = KeyboardCapitalization.None,
             autoCorrectEnabled = false,
-            // The computer is assumed to use a US layout, so ask for a
-            // keyboard that sticks to ASCII.
-            keyboardType = KeyboardType.Ascii,
+            // Text goes over as keysyms, which the computer types on its
+            // own layout, so any keyboard language works.
+            keyboardType = KeyboardType.Text,
         ),
         modifier = Modifier.size(1.dp).alpha(0f).focusRequester(focusRequester),
     )

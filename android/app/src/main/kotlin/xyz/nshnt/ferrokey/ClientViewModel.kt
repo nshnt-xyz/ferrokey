@@ -73,10 +73,10 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
 
     fun send(event: InputEvent) = sending { client.send(event) }
 
-    /** Types [text], skipping characters a US keyboard layout can't type. */
+    /** Types [text], skipping control characters other than newline and tab. */
     fun typeText(text: String, modifiers: Modifiers) = sending {
         if (client.typeText(text, modifiers) > 0u) {
-            Toast.makeText(getApplication(), "Skipped characters a US keyboard can't type", Toast.LENGTH_SHORT).show()
+            Toast.makeText(getApplication(), "Skipped characters that can't be typed", Toast.LENGTH_SHORT).show()
         }
     }
 
