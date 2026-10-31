@@ -2,6 +2,7 @@ package xyz.nshnt.ferrokey
 
 import android.app.Application
 import android.os.Build
+import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -73,7 +74,11 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     fun send(event: InputEvent) = sending { client.send(event) }
 
     /** Types [text], skipping characters a US keyboard layout can't type. */
-    fun typeText(text: String, modifiers: Modifiers) = sending { client.typeText(text, modifiers) }
+    fun typeText(text: String, modifiers: Modifiers) = sending {
+        if (client.typeText(text, modifiers) > 0u) {
+            Toast.makeText(getApplication(), "Skipped characters a US keyboard can't type", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     fun tapKey(key: SpecialKey, modifiers: Modifiers) = sending { client.tapKey(key, modifiers) }
 

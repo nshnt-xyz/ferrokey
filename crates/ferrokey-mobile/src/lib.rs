@@ -70,6 +70,13 @@ pub struct Modifiers {
     pub meta: bool,
 }
 
+/// How many characters of `text` [`Client::type_text`] types, which is how
+/// many backspaces it takes to erase them again.
+#[uniffi::export]
+pub fn typable_len(text: String) -> u32 {
+    keys::typable_len(&text).try_into().unwrap_or(u32::MAX)
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum ClientError {

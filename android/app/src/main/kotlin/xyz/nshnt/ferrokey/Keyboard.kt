@@ -26,6 +26,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import xyz.nshnt.ferrokey.core.Modifiers
 import xyz.nshnt.ferrokey.core.SpecialKey
+import xyz.nshnt.ferrokey.core.typableLen
 
 val NoModifiers = Modifiers(ctrl = false, alt = false, shift = false, meta = false)
 
@@ -42,16 +43,17 @@ private fun sentinel() = TextFieldValue(SENTINEL, TextRange(SENTINEL.length))
  * [focusRequester] focuses it.
  *
  * Keyboards edit text rather than sending key presses, so each edit is
- * diffed against the previous text: removed characters become backspaces
- * and added ones are typed. Between words the field is reset to [SENTINEL]
- * so it never grows; while the keyboard is composing a word it's left alone,
- * as resetting it would break the keyboard's suggestions and autocorrect.
+ * diffed against the previous text and reported to [onEdit] as a number of
+ * backspaces followed by the text to type. Removed characters the computer
+ * never received (ones a US layout can't type) don't count as backspaces.
+ * Between words the field is reset to [SENTINEL] so it never grows; while
+ * the keyboard is composing a word it's left alone, as resetting it would
+ * break the keyboard's word suggestions.
  */
 @Composable
 fun KeyboardCapture(
     focusRequester: FocusRequester,
-    onText: (String) -> Unit,
-    onBackspace: () -> Unit,
+    onEdit: (backspaces: Int, text: String) -> Unit,
 ) {
     var value by remember { mutableStateOf(sentinel()) }
     BasicTextField(
@@ -59,9 +61,9 @@ fun KeyboardCapture(
         onValueChange = { new ->
             val old = value.text
             val common = old.commonPrefixWith(new.text).length
-            repeat(old.length - common) { onBackspace() }
+            val backspaces = typableLen(old.substring(common)).toInt()
             val added = new.text.substring(common)
-            if (added.isNotEmpty()) onText(added)
+            if (backspaces > 0 || added.isNotEmpty()) onEdit(backspaces, added)
             value = if (new.composition == null) sentinel() else new
         },
         keyboardOptions = KeyboardOptions(

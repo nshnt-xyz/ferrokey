@@ -22,6 +22,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,19 +68,37 @@ fun TouchpadScreen(
 
     // Modifiers from the key bar apply to the next key only.
     var modifiers by remember { mutableStateOf(NoModifiers) }
-    val type = { text: String ->
-        typeText(text, modifiers)
-        modifiers = NoModifiers
-    }
     val tap = { key: SpecialKey ->
         tapKey(key, modifiers)
         modifiers = NoModifiers
+    }
+    val edit = { backspaces: Int, text: String ->
+        val singleChar = text.isNotEmpty() && text.codePointCount(0, text.length) == 1
+        when {
+            // A single key press takes the armed modifiers.
+            backspaces == 1 && text.isEmpty() -> tap(SpecialKey.BACKSPACE)
+            backspaces == 0 && singleChar -> {
+                typeText(text, modifiers)
+                modifiers = NoModifiers
+            }
+            // A whole word, suggestion or correction is typed plainly, so
+            // Ctrl doesn't turn into Ctrl+Backspace or Ctrl+H, Ctrl+E, ...
+            else -> {
+                repeat(backspaces) { tapKey(SpecialKey.BACKSPACE, NoModifiers) }
+                if (text.isNotEmpty()) typeText(text, NoModifiers)
+            }
+        }
     }
 
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val keyboardVisible = WindowInsets.isImeVisible
+    // The key bar is the only sign a modifier is armed, so disarm them when
+    // it goes away with the keyboard.
+    LaunchedEffect(keyboardVisible) {
+        if (!keyboardVisible) modifiers = NoModifiers
+    }
 
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -93,11 +112,7 @@ fun TouchpadScreen(
                     modifier = Modifier.weight(1f),
                 )
                 TextButton(onClick = onDisconnect) { Text("Disconnect") }
-                KeyboardCapture(
-                    focusRequester,
-                    onText = type,
-                    onBackspace = { tap(SpecialKey.BACKSPACE) },
-                )
+                KeyboardCapture(focusRequester, onEdit = edit)
             }
             Box(
                 modifier = Modifier

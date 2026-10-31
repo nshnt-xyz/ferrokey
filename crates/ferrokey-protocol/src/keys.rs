@@ -209,6 +209,12 @@ pub fn type_text(text: &str, modifiers: Modifiers, out: &mut Vec<InputEvent>) ->
     skipped
 }
 
+/// How many characters of `text` [`type_text`] types, which is how many
+/// backspaces it takes to erase them again.
+pub fn typable_len(text: &str) -> usize {
+    text.chars().filter(|&c| char_key(c).is_some()).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +234,7 @@ mod tests {
         assert_eq!(char_key('\n'), Some((KEY_ENTER, false)));
         assert_eq!(char_key('é'), None);
         assert_eq!(SpecialKey::F10.code(), 68);
+        assert_eq!(typable_len("aé😀b"), 2);
     }
 
     #[test]
