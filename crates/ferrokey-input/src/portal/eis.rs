@@ -18,9 +18,9 @@ use reis::event::{Connection, Device, DeviceCapability, EiEvent};
 use reis::tokio::EiConvertEventStream;
 use tokio::sync::mpsc;
 
-use super::dbus::{NO_SCREEN, button_code};
+use super::dbus::button_code;
 use super::layout::{Area, Layout};
-use super::{BoxError, InjectError, Reporter};
+use super::{BoxError, InjectError, NO_SCREEN, Reporter};
 
 /// How long [`Eis::connect`] waits for the compositor to offer devices.
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -222,7 +222,7 @@ impl Eis {
                 }
                 Ok(())
             }
-            InputEvent::MoveTo { x, y } => {
+            InputEvent::MouseMoveAbsolute { x, y } => {
                 let (device, pointer) =
                     self.interface::<ei::PointerAbsolute>(DeviceCapability::PointerAbsolute)?;
                 let (x, y) = locate(&device, x, y)?;
@@ -256,31 +256,32 @@ impl Eis {
     }
 }
 
-/// Places a fraction of the shared area on one of `device`'s regions, in
-/// global logical pixels as libei wants them.
-fn locate(device: &Device, x: f32, y: f32) -> Result<(f32, f32), InjectError> {
+/// Places an absolute position, in [`InputEvent::ABSOLUTE_MAX`] units, on
+/// `device`'s regions, in global logical pixels as libei wants them.
+fn locate(device: &Device, x: u16, y: u16) -> Result<(f32, f32), InjectError> {
+    let max = f32::from(InputEvent::ABSOLUTE_MAX);
+    let (x, y) = (f32::from(x) / max, f32::from(y) / max);
     let layout = Layout::new(device.regions().iter().map(|region| Area {
-        id: (),
         x: region.x.into(),
         y: region.y.into(),
         width: region.width.into(),
         height: region.height.into(),
     }));
-    let point = layout
+    let (x, y) = layout
         .locate(x, y)
         .ok_or(InjectError::Unavailable(NO_SCREEN))?;
-    Ok((point.global.0 as f32, point.global.1 as f32))
+    Ok((x as f32, y as f32))
 }
 
 fn missing(capability: DeviceCapability) -> &'static str {
     match capability {
         DeviceCapability::Pointer => "the compositor offers no libei pointer",
         DeviceCapability::PointerAbsolute => {
-            "the compositor offers no absolute libei pointer; start the server with --screen"
+            "the compositor offers no absolute libei pointer; is screen sharing on?"
         }
         DeviceCapability::Keyboard => "the compositor offers no libei keyboard",
         DeviceCapability::Touch => {
-            "the compositor offers no libei touchscreen; start the server with --screen"
+            "the compositor offers no libei touchscreen; is screen sharing on?"
         }
         DeviceCapability::Scroll => "the compositor offers no libei scrolling",
         DeviceCapability::Button => "the compositor offers no libei buttons",

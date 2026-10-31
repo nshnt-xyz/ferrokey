@@ -6,11 +6,6 @@ pub mod keys;
 pub const DEFAULT_PORT: u16 = 47800;
 
 /// A single input event sent from the client to the server.
-///
-/// Absolute positions (`MoveTo` and the touch events) are fractions of the
-/// shared screen area, from `0.0` at the top left to `1.0` at the bottom
-/// right, since the client doesn't know the screen's size. The server needs
-/// a shared screen to place them (`ferrokey-server --screen`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputEvent {
     /// Relative pointer motion.
@@ -21,6 +16,11 @@ pub enum InputEvent {
     Scroll { dx: i32, dy: i32 },
     /// Key press or release, identified by a Linux evdev keycode.
     Key { code: u32, pressed: bool },
+    /// Moves the pointer to a point on the shared screen, given as fractions
+    /// of its width and height: 0 is the left or top edge and
+    /// [`InputEvent::ABSOLUTE_MAX`] the right or bottom one. Only works
+    /// while the server shares its screen.
+    MouseMoveAbsolute { x: u16, y: u16 },
     /// Key press or release, identified by an XKB keysym. The computer finds
     /// the key that types it on its own layout; see [`keys::char_keysym`].
     Keysym { keysym: u32, pressed: bool },
@@ -28,13 +28,12 @@ pub enum InputEvent {
     /// scroll gesture (the fingers lifted), which lets the computer start
     /// kinetic scrolling; it can come with zero motion.
     SmoothScroll { dx: f32, dy: f32, finish: bool },
-    /// Moves the pointer to an absolute position.
-    MoveTo { x: f32, y: f32 },
-    /// A finger touched the screen. `id` tells fingers apart while they're
-    /// down and can be reused once lifted.
-    TouchDown { id: u32, x: f32, y: f32 },
+    /// A finger touched the shared screen, at a point given like
+    /// [`InputEvent::MouseMoveAbsolute`]'s. `id` tells fingers apart while
+    /// they're down and can be reused once lifted.
+    TouchDown { id: u32, x: u16, y: u16 },
     /// A finger that is down moved.
-    TouchMove { id: u32, x: f32, y: f32 },
+    TouchMove { id: u32, x: u16, y: u16 },
     /// A finger lifted.
     TouchUp { id: u32 },
 }
@@ -52,8 +51,8 @@ pub enum DecodeError {
     Truncated,
     /// The event tag is not one this version understands.
     UnknownTag(u8),
-    /// A field holds a value outside its valid range, such as a position
-    /// that is NaN or infinite.
+    /// A field holds a value outside its valid range, such as a scroll
+    /// distance that is NaN or infinite.
     InvalidValue,
 }
 
@@ -73,16 +72,20 @@ const TAG_MOUSE_MOVE: u8 = 1;
 const TAG_MOUSE_BUTTON: u8 = 2;
 const TAG_SCROLL: u8 = 3;
 const TAG_KEY: u8 = 4;
-const TAG_KEYSYM: u8 = 5;
-const TAG_SMOOTH_SCROLL: u8 = 6;
-const TAG_MOVE_TO: u8 = 7;
+const TAG_MOUSE_MOVE_ABSOLUTE: u8 = 5;
+const TAG_KEYSYM: u8 = 6;
+const TAG_SMOOTH_SCROLL: u8 = 7;
 const TAG_TOUCH_DOWN: u8 = 8;
 const TAG_TOUCH_MOVE: u8 = 9;
 const TAG_TOUCH_UP: u8 = 10;
 
 impl InputEvent {
     /// Upper bound on the size of one encoded event.
-    pub const MAX_ENCODED_LEN: usize = 13;
+    pub const MAX_ENCODED_LEN: usize = 10;
+
+    /// The largest coordinate of [`InputEvent::MouseMoveAbsolute`] and the
+    /// touch events.
+    pub const ABSOLUTE_MAX: u16 = u16::MAX;
 
     /// Appends the binary encoding of this event to `out`.
     ///
@@ -115,6 +118,11 @@ impl InputEvent {
                 out.extend_from_slice(&code.to_be_bytes());
                 out.push(pressed.into());
             }
+            InputEvent::MouseMoveAbsolute { x, y } => {
+                out.push(TAG_MOUSE_MOVE_ABSOLUTE);
+                out.extend_from_slice(&x.to_be_bytes());
+                out.extend_from_slice(&y.to_be_bytes());
+            }
             InputEvent::Keysym { keysym, pressed } => {
                 out.push(TAG_KEYSYM);
                 out.extend_from_slice(&keysym.to_be_bytes());
@@ -126,19 +134,12 @@ impl InputEvent {
                 out.extend_from_slice(&dy.to_be_bytes());
                 out.push(finish.into());
             }
-            InputEvent::MoveTo { x, y } => {
-                out.push(TAG_MOVE_TO);
-                out.extend_from_slice(&x.to_be_bytes());
-                out.extend_from_slice(&y.to_be_bytes());
-            }
-            InputEvent::TouchDown { id, x, y } => {
-                out.push(TAG_TOUCH_DOWN);
-                out.extend_from_slice(&id.to_be_bytes());
-                out.extend_from_slice(&x.to_be_bytes());
-                out.extend_from_slice(&y.to_be_bytes());
-            }
-            InputEvent::TouchMove { id, x, y } => {
-                out.push(TAG_TOUCH_MOVE);
+            InputEvent::TouchDown { id, x, y } | InputEvent::TouchMove { id, x, y } => {
+                out.push(if matches!(self, InputEvent::TouchDown { .. }) {
+                    TAG_TOUCH_DOWN
+                } else {
+                    TAG_TOUCH_MOVE
+                });
                 out.extend_from_slice(&id.to_be_bytes());
                 out.extend_from_slice(&x.to_be_bytes());
                 out.extend_from_slice(&y.to_be_bytes());
@@ -180,6 +181,10 @@ impl InputEvent {
                 code: reader.u32()?,
                 pressed: reader.bool()?,
             },
+            TAG_MOUSE_MOVE_ABSOLUTE => InputEvent::MouseMoveAbsolute {
+                x: reader.u16()?,
+                y: reader.u16()?,
+            },
             TAG_KEYSYM => InputEvent::Keysym {
                 keysym: reader.u32()?,
                 pressed: reader.bool()?,
@@ -189,19 +194,15 @@ impl InputEvent {
                 dy: reader.f32()?,
                 finish: reader.bool()?,
             },
-            TAG_MOVE_TO => InputEvent::MoveTo {
-                x: reader.f32()?,
-                y: reader.f32()?,
-            },
             TAG_TOUCH_DOWN => InputEvent::TouchDown {
                 id: reader.u32()?,
-                x: reader.f32()?,
-                y: reader.f32()?,
+                x: reader.u16()?,
+                y: reader.u16()?,
             },
             TAG_TOUCH_MOVE => InputEvent::TouchMove {
                 id: reader.u32()?,
-                x: reader.f32()?,
-                y: reader.f32()?,
+                x: reader.u16()?,
+                y: reader.u16()?,
             },
             TAG_TOUCH_UP => InputEvent::TouchUp { id: reader.u32()? },
             tag => return Err(DecodeError::UnknownTag(tag)),
@@ -250,6 +251,10 @@ impl Reader<'_> {
         }
     }
 
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_be_bytes(self.take()?))
+    }
+
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_be_bytes(self.take()?))
     }
@@ -295,6 +300,10 @@ mod tests {
             code: u32::MAX,
             pressed: false,
         },
+        InputEvent::MouseMoveAbsolute {
+            x: 0,
+            y: InputEvent::ABSOLUTE_MAX,
+        },
         InputEvent::Keysym {
             keysym: 0x0100_20ac,
             pressed: true,
@@ -309,16 +318,15 @@ mod tests {
             dy: 0.0,
             finish: true,
         },
-        InputEvent::MoveTo { x: 0.25, y: 1.0 },
         InputEvent::TouchDown {
             id: 3,
-            x: 0.0,
-            y: 0.5,
+            x: 0,
+            y: 32768,
         },
         InputEvent::TouchMove {
             id: 3,
-            x: 0.125,
-            y: 0.75,
+            x: InputEvent::ABSOLUTE_MAX,
+            y: 1,
         },
         InputEvent::TouchUp { id: u32::MAX },
     ];
@@ -353,9 +361,10 @@ mod tests {
             InputEvent::decode(&[TAG_KEY, 0, 0, 0, 1, 2]),
             Err(DecodeError::InvalidValue)
         );
-        let mut nan = vec![TAG_MOVE_TO];
+        let mut nan = vec![TAG_SMOOTH_SCROLL];
         nan.extend_from_slice(&f32::NAN.to_be_bytes());
         nan.extend_from_slice(&0.5f32.to_be_bytes());
+        nan.push(0);
         assert_eq!(InputEvent::decode(&nan), Err(DecodeError::InvalidValue));
         assert_eq!(
             InputEvent::decode(&[TAG_TOUCH_UP, 0, 0]),

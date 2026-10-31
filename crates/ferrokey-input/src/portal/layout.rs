@@ -1,39 +1,28 @@
 //! Placing absolute positions on the shared screens.
 //!
-//! Clients send positions as fractions of the whole shared area, since they
-//! don't know the screen size. The portal wants them relative to one screen
-//! cast stream, and libei in global logical pixels inside one of a device's
-//! regions, so both go through [`Layout`].
+//! Clients send positions as fractions of the shared screen, since they
+//! don't know its size. libei wants them in global logical pixels inside one
+//! of a device's regions, which can span several monitors; [`Layout`] maps
+//! between the two.
 
 /// One screen, in global logical pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Area<T> {
-    pub id: T,
+pub(super) struct Area {
     pub x: f64,
     pub y: f64,
     pub width: f64,
     pub height: f64,
 }
 
-/// A point on one of the areas.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Point<T> {
-    pub id: T,
-    /// Global logical pixels.
-    pub global: (f64, f64),
-    /// Logical pixels from the area's top left corner.
-    pub local: (f64, f64),
-}
-
-/// The shared screens, laid out as the compositor arranges them.
+/// The screens, laid out as the compositor arranges them.
 #[derive(Debug, Clone, Default)]
-pub(super) struct Layout<T> {
-    areas: Vec<Area<T>>,
+pub(super) struct Layout {
+    areas: Vec<Area>,
 }
 
-impl<T: Copy> Layout<T> {
+impl Layout {
     /// Areas with no size are left out.
-    pub fn new(areas: impl IntoIterator<Item = Area<T>>) -> Self {
+    pub fn new(areas: impl IntoIterator<Item = Area>) -> Self {
         let areas = areas
             .into_iter()
             .filter(|area| area.width > 0.0 && area.height > 0.0)
@@ -41,16 +30,13 @@ impl<T: Copy> Layout<T> {
         Self { areas }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.areas.is_empty()
-    }
-
     /// Maps a fraction of the bounding box of all areas, with `(0, 0)` at
-    /// its top left and `(1, 1)` at its bottom right, onto an area.
+    /// its top left and `(1, 1)` at its bottom right, to global logical
+    /// pixels on one of the areas.
     ///
     /// Positions outside `0..=1` are clamped. A position in a gap between
     /// screens of different sizes goes to the nearest point on a screen.
-    pub fn locate(&self, x: f32, y: f32) -> Option<Point<T>> {
+    pub fn locate(&self, x: f32, y: f32) -> Option<(f64, f64)> {
         let first = self.areas.first()?;
         let mut bounds = (
             first.x,
@@ -74,15 +60,9 @@ impl<T: Copy> Layout<T> {
             .map(|area| {
                 // Stay a little inside the far edges, which belong to the
                 // next screen over.
-                let lx = (gx - area.x).clamp(0.0, (area.width - 1.0).max(0.0));
-                let ly = (gy - area.y).clamp(0.0, (area.height - 1.0).max(0.0));
-                let distance = (area.x + lx - gx).hypot(area.y + ly - gy);
-                let point = Point {
-                    id: area.id,
-                    global: (area.x + lx, area.y + ly),
-                    local: (lx, ly),
-                };
-                (distance, point)
+                let px = gx.clamp(area.x, area.x + (area.width - 1.0).max(0.0));
+                let py = gy.clamp(area.y, area.y + (area.height - 1.0).max(0.0));
+                ((px - gx).hypot(py - gy), (px, py))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, point)| point)
@@ -93,9 +73,8 @@ impl<T: Copy> Layout<T> {
 mod tests {
     use super::*;
 
-    fn area(id: u32, x: f64, y: f64, width: f64, height: f64) -> Area<u32> {
+    fn area(x: f64, y: f64, width: f64, height: f64) -> Area {
         Area {
-            id,
             x,
             y,
             width,
@@ -105,14 +84,11 @@ mod tests {
 
     #[test]
     fn maps_onto_one_screen() {
-        let layout = Layout::new([area(7, 0.0, 0.0, 1920.0, 1080.0)]);
-        let point = layout.locate(0.5, 0.25).unwrap();
-        assert_eq!(point.id, 7);
-        assert_eq!(point.local, (960.0, 270.0));
-        assert_eq!(point.global, (960.0, 270.0));
+        let layout = Layout::new([area(0.0, 0.0, 1920.0, 1080.0)]);
+        assert_eq!(layout.locate(0.5, 0.25), Some((960.0, 270.0)));
         // The far edge and anything past it stays on the screen.
-        assert_eq!(layout.locate(1.0, 2.0).unwrap().local, (1919.0, 1079.0));
-        assert_eq!(layout.locate(-1.0, 0.0).unwrap().local, (0.0, 0.0));
+        assert_eq!(layout.locate(1.0, 2.0), Some((1919.0, 1079.0)));
+        assert_eq!(layout.locate(-1.0, 0.0), Some((0.0, 0.0)));
     }
 
     #[test]
@@ -120,26 +96,18 @@ mod tests {
         // A 1080p screen with a taller, offset one to its right, both
         // starting below the global origin.
         let layout = Layout::new([
-            area(1, 0.0, 100.0, 1920.0, 1080.0),
-            area(2, 1920.0, 0.0, 1000.0, 1500.0),
-            area(3, 0.0, 0.0, 0.0, 0.0),
+            area(0.0, 100.0, 1920.0, 1080.0),
+            area(1920.0, 0.0, 1000.0, 1500.0),
+            area(0.0, 0.0, 0.0, 0.0),
         ]);
-        let point = layout.locate(0.75, 0.5).unwrap();
-        assert_eq!(point.id, 2);
-        assert_eq!(point.global, (2190.0, 750.0));
-        assert_eq!(point.local, (270.0, 750.0));
-
+        assert_eq!(layout.locate(0.75, 0.5), Some((2190.0, 750.0)));
         // Below the shorter screen goes to its bottom edge.
-        let point = layout.locate(0.125, 1.0).unwrap();
-        assert_eq!(point.id, 1);
-        assert_eq!(point.global, (365.0, 1179.0));
-        assert_eq!(point.local, (365.0, 1079.0));
+        assert_eq!(layout.locate(0.125, 1.0), Some((365.0, 1179.0)));
     }
 
     #[test]
     fn empty_layout_places_nothing() {
-        let layout = Layout::<u32>::new([area(1, 0.0, 0.0, 0.0, 10.0)]);
-        assert!(layout.is_empty());
+        let layout = Layout::new([area(0.0, 0.0, 0.0, 10.0)]);
         assert_eq!(layout.locate(0.5, 0.5), None);
     }
 }

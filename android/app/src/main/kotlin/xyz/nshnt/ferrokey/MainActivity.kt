@@ -13,6 +13,7 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 
 class MainActivity : ComponentActivity() {
@@ -25,6 +26,20 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    // Don't stream the screen to an app nobody can see.
+    override fun onStart() {
+        super.onStart()
+        model().setVisible(true)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        model().setVisible(false)
+    }
+
+    /** The same model [FerrokeyApp] gets from `viewModel()`. */
+    private fun model() = ViewModelProvider(this)[ClientViewModel::class.java]
 }
 
 @Composable
@@ -39,6 +54,14 @@ private fun FerrokeyApp(model: ClientViewModel) {
             typeText = model::typeText,
             tapKey = model::tapKey,
             onDisconnect = { model.disconnect() },
+            screen = ScreenState(
+                available = model.screenAvailable,
+                watching = model.watching,
+                frame = model.screen,
+                start = model::startScreen,
+                stop = model::stopScreen,
+                pointAt = model::pointAt,
+            ),
         )
     }
 }

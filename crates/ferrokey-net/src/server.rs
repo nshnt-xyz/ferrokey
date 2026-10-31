@@ -1,4 +1,5 @@
-//! The accepting side: authenticates clients and receives their events.
+//! The accepting side: authenticates clients, receives their events and
+//! sends screen frames.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -20,12 +21,50 @@ pub trait Authorizer {
     fn is_trusted(&self, key: &PublicKey) -> bool;
 }
 
+/// What the server offers clients, announced during [`accept`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Features {
+    /// The server can share its screen.
+    pub screen: bool,
+}
+
 /// An authenticated connection from a paired client.
+///
+/// [`Session::split`] separates it into a [`Sender`] and a [`Receiver`] for
+/// use from different threads.
 pub struct Session {
-    channel: Channel,
+    sender: Sender,
+    receiver: Receiver,
     device_key: PublicKey,
     device_name: String,
     newly_paired: bool,
+}
+
+/// The sending half of a [`Session`].
+pub struct Sender {
+    channel: ChannelWriter,
+    payload: Vec<u8>,
+}
+
+/// The receiving half of a [`Session`].
+pub struct Receiver {
+    channel: ChannelReader,
+}
+
+/// A message from the client.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientMessage {
+    Keepalive,
+    Input(Vec<InputEvent>),
+    /// Start sending screen frames that fit in `max_width` by `max_height`,
+    /// in either orientation.
+    StartScreen {
+        max_width: u16,
+        max_height: u16,
+    },
+    StopScreen,
+    /// The client is done with one frame; see [`FRAMES_IN_FLIGHT`].
+    FrameAck,
 }
 
 impl Session {
@@ -43,15 +82,40 @@ impl Session {
         self.newly_paired
     }
 
-    /// Waits for the next message from the client.
-    ///
-    /// Returns an empty batch for a keepalive, and fails if the client has
-    /// been silent for longer than keepalives allow.
-    pub fn recv_events(&mut self) -> Result<Vec<InputEvent>> {
+    pub fn recv(&mut self) -> Result<ClientMessage> {
+        self.receiver.recv()
+    }
+
+    pub fn shutdown(&self) {
+        self.sender.shutdown();
+    }
+
+    pub fn split(self) -> (Sender, Receiver) {
+        (self.sender, self.receiver)
+    }
+}
+
+impl Receiver {
+    /// Waits for the next message from the client, failing if it has been
+    /// silent for longer than keepalives allow.
+    pub fn recv(&mut self) -> Result<ClientMessage> {
         let payload = self.channel.recv()?;
-        InputEvent::decode_all(&payload)
-            .collect::<Result<_, _>>()
-            .map_err(|_| Error::Protocol("malformed input event"))
+        let Some((&kind, body)) = payload.split_first() else {
+            return Ok(ClientMessage::Keepalive);
+        };
+        match (kind, body) {
+            (MSG_INPUT, events) => InputEvent::decode_all(events)
+                .collect::<Result<_, _>>()
+                .map(ClientMessage::Input)
+                .map_err(|_| Error::Protocol("malformed input event")),
+            (MSG_START_SCREEN, &[w0, w1, h0, h1]) => Ok(ClientMessage::StartScreen {
+                max_width: u16::from_be_bytes([w0, w1]),
+                max_height: u16::from_be_bytes([h0, h1]),
+            }),
+            (MSG_STOP_SCREEN, []) => Ok(ClientMessage::StopScreen),
+            (MSG_FRAME_ACK, []) => Ok(ClientMessage::FrameAck),
+            _ => Err(Error::Protocol("unknown message from client")),
+        }
     }
 
     pub fn shutdown(&self) {
@@ -59,8 +123,52 @@ impl Session {
     }
 }
 
+impl Sender {
+    /// Sends a screen frame, a `width` by `height` JPEG image, split over as
+    /// many messages as it takes.
+    pub fn send_frame(&mut self, width: u16, height: u16, jpeg: &[u8]) -> Result<()> {
+        if jpeg.len() > MAX_FRAME_LEN {
+            return Err(Error::Protocol("frame too large"));
+        }
+        let (first, mut rest) =
+            jpeg.split_at(jpeg.len().min(Channel::MAX_PAYLOAD_LEN - FRAME_HEADER_LEN));
+        self.payload.clear();
+        self.payload.push(MSG_FRAME);
+        self.payload.extend_from_slice(&width.to_be_bytes());
+        self.payload.extend_from_slice(&height.to_be_bytes());
+        self.payload
+            .extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        self.payload.extend_from_slice(first);
+        self.channel.send(&self.payload)?;
+        while !rest.is_empty() {
+            let (chunk, tail) = rest.split_at(rest.len().min(Channel::MAX_PAYLOAD_LEN - 1));
+            rest = tail;
+            self.payload.clear();
+            self.payload.push(MSG_FRAME_DATA);
+            self.payload.extend_from_slice(chunk);
+            self.channel.send(&self.payload)?;
+        }
+        Ok(())
+    }
+
+    /// Tells the client the screen is not being shared (any more).
+    pub fn send_screen_stopped(&mut self) -> Result<()> {
+        self.channel.send(&[MSG_SCREEN_STOPPED])
+    }
+
+    /// Closes the connection, which also ends a blocked [`Receiver::recv`].
+    pub fn shutdown(&self) {
+        self.channel.shutdown();
+    }
+}
+
 /// Runs the server side of the handshake on a freshly accepted connection.
-pub fn accept(mut stream: TcpStream, keypair: &Keypair, auth: &impl Authorizer) -> Result<Session> {
+pub fn accept(
+    mut stream: TcpStream,
+    keypair: &Keypair,
+    auth: &impl Authorizer,
+    features: Features,
+) -> Result<Session> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -127,11 +235,7 @@ pub fn accept(mut stream: TcpStream, keypair: &Keypair, auth: &impl Authorizer) 
             .ok_or(Error::Protocol("no client key"))?,
     )?;
 
-    let mut channel = Channel {
-        stream,
-        noise: noise.into_transport_mode()?,
-        buf: Vec::new(),
-    };
+    let mut channel = Channel::new(stream, noise)?;
     let newly_paired = psk.is_some();
     if newly_paired {
         auth.add_device(&device_key, &device_name)?;
@@ -139,11 +243,19 @@ pub fn accept(mut stream: TcpStream, keypair: &Keypair, auth: &impl Authorizer) 
         channel.send(&[VERDICT_UNKNOWN_DEVICE])?;
         return Err(Error::UnknownDevice);
     }
-    channel.send(&[VERDICT_ACCEPTED])?;
+    let feature_bits = if features.screen { FEATURE_SCREEN } else { 0 };
+    channel.send(&[VERDICT_ACCEPTED, feature_bits])?;
 
-    channel.stream.set_read_timeout(Some(IDLE_TIMEOUT))?;
+    // Keepalives arrive well within the idle timeout. The handshake's write
+    // timeout stays, so a client that stops reading can't stall the server.
+    channel.stream().set_read_timeout(Some(IDLE_TIMEOUT))?;
+    let (writer, reader) = channel.split();
     Ok(Session {
-        channel,
+        sender: Sender {
+            channel: writer,
+            payload: Vec::new(),
+        },
+        receiver: Receiver { channel: reader },
         device_key,
         device_name,
         newly_paired,

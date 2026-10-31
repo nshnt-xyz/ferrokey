@@ -11,10 +11,7 @@ pub(super) const BTN_LEFT: u32 = 0x110;
 pub(super) const BTN_RIGHT: u32 = 0x111;
 pub(super) const BTN_MIDDLE: u32 = 0x112;
 
-pub(super) const NO_SCREEN: &str =
-    "absolute positions need a shared screen; start the server with --screen";
-pub(super) const NO_TOUCHSCREEN: &str =
-    "the session has no touchscreen; start the server with --screen";
+const NO_TOUCHSCREEN: &str = "the session has no touchscreen";
 
 pub(super) fn button_code(button: MouseButton) -> u32 {
     match button {
@@ -80,32 +77,28 @@ async fn notify(portal: &Portal, event: InputEvent) -> Result<(), InjectError> {
                 .notify_keyboard_keysym(session, keysym, key_state(pressed), Default::default())
                 .await?;
         }
-        InputEvent::MoveTo { x, y } => {
-            let point = portal
-                .screens
-                .locate(x, y)
-                .ok_or(InjectError::Unavailable(NO_SCREEN))?;
-            let (x, y) = point.local;
+        InputEvent::MouseMoveAbsolute { x, y } => {
+            let Some((node, x, y)) = portal.screen_point(x, y)? else {
+                return Ok(());
+            };
             proxy
-                .notify_pointer_motion_absolute(session, point.id, x, y, Default::default())
+                .notify_pointer_motion_absolute(session, node, x, y, Default::default())
                 .await?;
         }
         InputEvent::TouchDown { id, x, y } | InputEvent::TouchMove { id, x, y } => {
             if !portal.devices.contains(DeviceType::Touchscreen) {
                 return Err(InjectError::Unavailable(NO_TOUCHSCREEN));
             }
-            let point = portal
-                .screens
-                .locate(x, y)
-                .ok_or(InjectError::Unavailable(NO_SCREEN))?;
-            let (x, y) = point.local;
+            let Some((node, x, y)) = portal.screen_point(x, y)? else {
+                return Ok(());
+            };
             if matches!(event, InputEvent::TouchDown { .. }) {
                 proxy
-                    .notify_touch_down(session, point.id, id, x, y, Default::default())
+                    .notify_touch_down(session, node, id, x, y, Default::default())
                     .await?;
             } else {
                 proxy
-                    .notify_touch_motion(session, point.id, id, x, y, Default::default())
+                    .notify_touch_motion(session, node, id, x, y, Default::default())
                     .await?;
             }
         }

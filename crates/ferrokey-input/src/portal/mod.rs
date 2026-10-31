@@ -8,9 +8,10 @@
 //! with [`Options::eis`], over a libei connection the portal hands out
 //! ([`eis`]). A portal session can't mix the two.
 //!
-//! With [`Options::screen`] the session also shares the screens through the
-//! ScreenCast portal. Absolute pointer and touch positions are given
-//! relative to a shared screen, so they need it.
+//! When screen sharing is on, the same session also selects a monitor
+//! through the ScreenCast interface, and asks for a touchscreen device.
+//! That's what lets the phone see the screen, and what absolute pointer and
+//! touch positions are relative to.
 //!
 //! The portal API is async, so the session lives on a dedicated thread with
 //! its own runtime and [`PortalBackend::inject`] just queues events for it.
@@ -27,26 +28,31 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
-use ashpd::desktop::screencast::{Screencast, SelectSourcesOptions, SourceType};
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
 use ashpd::desktop::{PersistMode, Session};
+use ashpd::enumflags2::BitFlags;
 use ferrokey_protocol::InputEvent;
 use tokio::sync::mpsc;
 
-use self::layout::{Area, Layout};
+use crate::screen::Screen;
 use crate::{Error, InputBackend, Options};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+const NO_SCREEN: &str = "absolute positions need screen sharing, which is off or unavailable";
 
 pub struct PortalBackend {
     events: mpsc::UnboundedSender<InputEvent>,
 }
 
 impl PortalBackend {
-    /// Starts a RemoteDesktop session, blocking until it is running.
+    /// Starts a RemoteDesktop session, blocking until it is running, and
+    /// returns the shared screen if [`Options::screen`] is set and the user
+    /// picked one.
     ///
     /// The first run shows the compositor's permission dialog. The restore
     /// token it hands back is saved so later runs can skip the dialog.
-    pub fn new(options: Options) -> Result<Self, Error> {
+    pub fn new(options: Options) -> Result<(Self, Option<Screen>), Error> {
         let (events, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
 
@@ -83,7 +89,8 @@ impl PortalBackend {
                     } else {
                         None
                     };
-                    let _ = ready_tx.send(Ok(()));
+                    let screen = portal.shared.as_ref().map(|shared| shared.screen.clone());
+                    let _ = ready_tx.send(Ok(screen));
                     match eis {
                         Some(eis) => eis.run(rx).await,
                         None => dbus::run(&portal, rx).await,
@@ -93,8 +100,8 @@ impl PortalBackend {
             })
             .map_err(Error::backend)?;
 
-        ready_rx.recv().map_err(|_| Error::SessionClosed)??;
-        Ok(Self { events })
+        let screen = ready_rx.recv().map_err(|_| Error::SessionClosed)??;
+        Ok((Self { events }, screen))
     }
 }
 
@@ -108,10 +115,17 @@ impl InputBackend for PortalBackend {
 struct Portal {
     proxy: RemoteDesktop,
     session: Session<RemoteDesktop>,
-    devices: ashpd::enumflags2::BitFlags<DeviceType>,
-    /// The shared screens, by PipeWire node id. Empty without
-    /// [`Options::screen`].
-    screens: Layout<u32>,
+    devices: BitFlags<DeviceType>,
+    shared: Option<SharedScreen>,
+}
+
+/// The monitor shared through the session's ScreenCast stream.
+struct SharedScreen {
+    node_id: u32,
+    /// The stream's size in the compositor's logical coordinates, which
+    /// absolute pointer motion uses; may differ from its size in pixels.
+    logical_size: Option<(i32, i32)>,
+    screen: Screen,
 }
 
 impl Portal {
@@ -124,31 +138,40 @@ impl Portal {
             )
             .into());
         }
+        let session = proxy.create_session(Default::default()).await?;
 
+        let screencast = if options.screen {
+            match select_screen(&session).await {
+                Ok(screencast) => Some(screencast),
+                Err(err) => {
+                    eprintln!("ferrokey-input: screen sharing unavailable: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Touch positions are relative to the shared screen, so a
+        // touchscreen is only useful with one.
         let mut devices = DeviceType::Keyboard | DeviceType::Pointer;
-        if options.screen {
-            if proxy
-                .available_device_types()
-                .await?
-                .contains(DeviceType::Touchscreen)
-            {
-                devices |= DeviceType::Touchscreen;
-            } else {
-                eprintln!(
+        if screencast.is_some() {
+            match proxy.available_device_types().await {
+                Ok(available) if available.contains(DeviceType::Touchscreen) => {
+                    devices |= DeviceType::Touchscreen;
+                }
+                _ => eprintln!(
                     "ferrokey-input: the portal offers no touchscreen; touch input won't work"
-                );
+                ),
             }
         }
 
-        let session = proxy.create_session(Default::default()).await?;
-        // A token only restores the same kind of session, so sessions with
-        // and without a shared screen keep separate ones.
-        let token_name = if options.screen {
-            "portal-restore-token-screen"
+        let token_file = if screencast.is_some() {
+            SCREEN_TOKEN_FILE
         } else {
-            "portal-restore-token"
+            INPUT_TOKEN_FILE
         };
-        let restore_token = load_restore_token(token_name);
+        let restore_token = load_restore_token(token_file);
         proxy
             .select_devices(
                 &session,
@@ -158,51 +181,41 @@ impl Portal {
                     .set_restore_token(restore_token.as_deref()),
             )
             .await?;
-        if options.screen {
-            // Persistence is handled by the RemoteDesktop restore token.
-            Screencast::new()
-                .await?
-                .select_sources(
-                    &session,
-                    SelectSourcesOptions::default()
-                        .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Monitor))
-                        .set_multiple(true),
-                )
-                .await?;
-        }
 
         let selected = proxy
             .start(&session, None, Default::default())
             .await?
             .response()?;
         if let Some(token) = selected.restore_token() {
-            save_restore_token(token_name, token);
+            save_restore_token(token_file, token);
         }
 
-        let screens = Layout::new(selected.streams().iter().filter_map(|stream| {
-            let (width, height) = stream.size()?;
-            // Only a single stream may leave out its position.
-            let (x, y) = stream.position().unwrap_or_default();
-            Some(Area {
-                id: stream.pipe_wire_node_id(),
-                x: x.into(),
-                y: y.into(),
-                width: width.into(),
-                height: height.into(),
-            })
-        }));
-        if options.screen && screens.is_empty() {
-            eprintln!(
-                "ferrokey-input: no screen with a known size was shared; \
-                 absolute pointer and touch input won't work"
-            );
-        }
+        let shared = match (screencast, selected.streams().first()) {
+            (Some(screencast), Some(stream)) => {
+                match open_screen(&screencast, &session, stream.pipe_wire_node_id()).await {
+                    Ok(screen) => Some(SharedScreen {
+                        node_id: stream.pipe_wire_node_id(),
+                        logical_size: stream.size(),
+                        screen,
+                    }),
+                    Err(err) => {
+                        eprintln!("ferrokey-input: screen sharing unavailable: {err}");
+                        None
+                    }
+                }
+            }
+            (Some(_), None) => {
+                eprintln!("ferrokey-input: screen sharing unavailable: no screen was shared");
+                None
+            }
+            (None, _) => None,
+        };
 
         Ok(Self {
             proxy,
             session,
             devices: selected.devices(),
-            screens,
+            shared,
         })
     }
 
@@ -213,6 +226,75 @@ impl Portal {
             .await?;
         eis::Eis::connect(UnixStream::from(fd)).await
     }
+
+    /// Places an absolute position, in [`InputEvent::ABSOLUTE_MAX`] units,
+    /// on the shared screen: its PipeWire node and the point in the stream's
+    /// logical coordinates. `None` until the screen's size is known.
+    fn screen_point(&self, x: u16, y: u16) -> Result<Option<(u32, f64, f64)>, InjectError> {
+        let shared = self
+            .shared
+            .as_ref()
+            .ok_or(InjectError::Unavailable(NO_SCREEN))?;
+        let Some((width, height)) = shared
+            .logical_size
+            .map(|(w, h)| (f64::from(w), f64::from(h)))
+            .or_else(|| {
+                let (w, h) = shared.screen.frame_size()?;
+                Some((f64::from(w), f64::from(h)))
+            })
+        else {
+            return Ok(None);
+        };
+        let max = f64::from(InputEvent::ABSOLUTE_MAX);
+        Ok(Some((
+            shared.node_id,
+            f64::from(x) / max * width,
+            f64::from(y) / max * height,
+        )))
+    }
+}
+
+/// Asks for one monitor on the RemoteDesktop session. Must happen before
+/// the session starts, since the permission dialog covers both.
+async fn select_screen(session: &Session<RemoteDesktop>) -> ashpd::Result<Screencast> {
+    let screencast = Screencast::new().await?;
+    // Draw the pointer into the frames so the phone shows where it is.
+    let cursor_mode = match screencast.available_cursor_modes().await {
+        Ok(modes) if modes.contains(CursorMode::Embedded) => CursorMode::Embedded,
+        _ => CursorMode::Hidden,
+    };
+    screencast
+        .select_sources(
+            session,
+            SelectSourcesOptions::default()
+                .set_sources(BitFlags::from(SourceType::Monitor))
+                .set_multiple(false)
+                .set_cursor_mode(cursor_mode),
+        )
+        .await?;
+    Ok(screencast)
+}
+
+#[cfg(feature = "screen")]
+async fn open_screen(
+    screencast: &Screencast,
+    session: &Session<RemoteDesktop>,
+    node_id: u32,
+) -> Result<Screen, Error> {
+    let fd = screencast
+        .open_pipe_wire_remote(session, Default::default())
+        .await
+        .map_err(Error::backend)?;
+    crate::pipewire::capture(fd, node_id)
+}
+
+#[cfg(not(feature = "screen"))]
+async fn open_screen(
+    _screencast: &Screencast,
+    _session: &Session<RemoteDesktop>,
+    _node_id: u32,
+) -> Result<Screen, Error> {
+    Err(Error::Unsupported)
 }
 
 /// Why an event wasn't injected.
@@ -251,6 +333,11 @@ impl Reporter {
         }
     }
 }
+
+/// Restore tokens cover what the dialog granted, so sessions with and
+/// without the screen keep separate ones.
+const INPUT_TOKEN_FILE: &str = "portal-restore-token";
+const SCREEN_TOKEN_FILE: &str = "portal-restore-token-screen";
 
 /// `$XDG_STATE_HOME/ferrokey/<name>`, falling back to
 /// `~/.local/state` as the XDG base directory spec prescribes.

@@ -1,9 +1,12 @@
-//! Platform input injection backends.
+//! Platform input injection and screen capture backends.
 
 use ferrokey_protocol::InputEvent;
 
+#[cfg(all(target_os = "linux", feature = "screen"))]
+mod pipewire;
 #[cfg(target_os = "linux")]
 mod portal;
+pub mod screen;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -18,6 +21,8 @@ pub enum Error {
     Unsupported,
     /// The backend's session ended, so no more events can be injected.
     SessionClosed,
+    /// Absolute pointer motion needs a shared screen, and there is none.
+    NoScreen,
     /// The platform backend reported an error.
     Backend(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -34,6 +39,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Unsupported => f.write_str("input injection is not supported on this platform"),
             Error::SessionClosed => f.write_str("input session was closed"),
+            Error::NoScreen => f.write_str("absolute pointer motion needs screen sharing"),
             Error::Backend(err) => write!(f, "input backend error: {err}"),
         }
     }
@@ -48,26 +54,45 @@ impl std::error::Error for Error {
     }
 }
 
-/// Optional backend features. Platforms that don't need them ignore them.
+/// What [`backend`] should set up.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
-    /// Share the screen with the backend so it can place absolute pointer
-    /// and touch positions. On Linux this adds a ScreenCast stream to the
-    /// portal session, which the desktop shows as screen sharing.
+    /// Share the screen as well, where the platform supports it. On Linux
+    /// this also makes absolute pointer and touch input possible.
     pub screen: bool,
     /// Send events through libei instead of one D-Bus call each (Linux,
     /// RemoteDesktop portal version 2 and later).
     pub eis: bool,
 }
 
-/// Returns the input backend for the current platform.
-pub fn backend(options: Options) -> Result<Box<dyn InputBackend>, Error> {
+/// The platform's input injection and, if requested and available, screen
+/// capture.
+pub struct Backend {
+    pub input: Box<dyn InputBackend>,
+    pub screen: Option<screen::Screen>,
+}
+
+/// Returns the backend for the current platform.
+pub fn backend(options: Options) -> Result<Backend, Error> {
     #[cfg(target_os = "linux")]
-    return Ok(Box::new(portal::PortalBackend::new(options)?));
-    #[cfg(not(target_os = "linux"))]
-    let _ = options;
+    {
+        let (input, screen) = portal::PortalBackend::new(options)?;
+        Ok(Backend {
+            input: Box::new(input),
+            screen,
+        })
+    }
     #[cfg(target_os = "windows")]
-    return Ok(Box::new(windows::WindowsBackend::new()?));
+    {
+        let _ = options;
+        Ok(Backend {
+            input: Box::new(windows::WindowsBackend::new()?),
+            screen: None,
+        })
+    }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    Err(Error::Unsupported)
+    {
+        let _ = options;
+        Err(Error::Unsupported)
+    }
 }

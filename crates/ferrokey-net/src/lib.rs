@@ -24,21 +24,40 @@
 //! 3. Pairing only: client and server exchange framed SPAKE2 messages.
 //! 4. The three Noise handshake messages, framed. The client's device name
 //!    rides in the encrypted payload of the last one.
-//! 5. Server sends an encrypted verdict: accepted, or unknown device.
-//! 6. Client sends encrypted batches of [`InputEvent`]s; an empty message is
-//!    a keepalive.
+//! 5. Server sends an encrypted verdict: accepted along with a feature byte
+//!    (see [`FEATURE_SCREEN`]), or unknown device.
+//! 6. Both sides exchange encrypted messages, described below.
 //!
 //! Frames are a big-endian `u16` length followed by that many bytes. Every
 //! plaintext byte from steps 1 to 3 is bound into the Noise prologue, so
 //! tampering with them makes the handshake fail.
 //!
+//! Each message after the handshake starts with a kind byte. From the client:
+//!
+//! - nothing at all: a keepalive.
+//! - `input`: a batch of [`InputEvent`]s.
+//! - `start screen`, `max width: u16`, `max height: u16`: start sending
+//!   screen frames that fit in that size (in either orientation).
+//! - `stop screen`.
+//! - `frame ack`: the client has dealt with a frame. The server keeps at
+//!   most [`FRAMES_IN_FLIGHT`] unacknowledged frames on the way, so a slow
+//!   link or phone gets fewer frames rather than more and more delay.
+//!
+//! From the server, only once the client has asked for the screen:
+//!
+//! - `frame`, `width: u16`, `height: u16`, `length: u32`, then the start of a
+//!   JPEG image of that many bytes. Images rarely fit in one message, so the
+//!   rest follows in `frame data` messages.
+//! - `screen stopped`: the computer stopped sharing its screen, or never was.
+//!
 //! [`InputEvent`]: ferrokey_protocol::InputEvent
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::Duration;
 
-use snow::{HandshakeState, TransportState};
+use snow::{HandshakeState, StatelessTransportState};
 
 pub mod client;
 pub mod server;
@@ -46,7 +65,7 @@ pub mod server;
 pub use ferrokey_protocol::DEFAULT_PORT;
 
 const MAGIC: &[u8; 4] = b"FKEY";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const HELLO_LEN: usize = 6;
 
 const MODE_CONNECT: u8 = 0;
@@ -58,6 +77,27 @@ const STATUS_PAIRING_UNAVAILABLE: u8 = 2;
 
 const VERDICT_ACCEPTED: u8 = 0;
 const VERDICT_UNKNOWN_DEVICE: u8 = 1;
+
+/// Verdict feature bit: the server can share its screen.
+pub const FEATURE_SCREEN: u8 = 1 << 0;
+
+// Client message kinds.
+const MSG_INPUT: u8 = 0;
+const MSG_START_SCREEN: u8 = 1;
+const MSG_STOP_SCREEN: u8 = 2;
+const MSG_FRAME_ACK: u8 = 3;
+
+// Server message kinds.
+const MSG_FRAME: u8 = 0;
+const MSG_FRAME_DATA: u8 = 1;
+const MSG_SCREEN_STOPPED: u8 = 2;
+
+/// Header of a [`MSG_FRAME`] message: kind, width, height and length.
+const FRAME_HEADER_LEN: usize = 1 + 2 + 2 + 4;
+/// Largest JPEG image the client accepts.
+pub const MAX_FRAME_LEN: usize = 16 << 20;
+/// How many frames the server sends before waiting for an acknowledgement.
+pub const FRAMES_IN_FLIGHT: u32 = 2;
 
 const NOISE_CONNECT: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const NOISE_PAIR: &str = "Noise_XXpsk3_25519_ChaChaPoly_BLAKE2s";
@@ -200,35 +240,101 @@ impl std::fmt::Debug for Keypair {
     }
 }
 
-/// An encrypted, authenticated message stream over TCP.
-pub struct Channel {
+/// An encrypted, authenticated message stream over TCP, split into halves
+/// so one thread can send while another waits for messages.
+///
+/// The halves share the Noise keys but each counts its own nonces, which is
+/// all a direction's state amounts to, so neither ever waits on the other.
+pub(crate) struct Channel {
+    writer: ChannelWriter,
+    reader: ChannelReader,
+}
+
+pub(crate) struct ChannelWriter {
     stream: TcpStream,
-    noise: TransportState,
+    noise: Arc<StatelessTransportState>,
+    nonce: u64,
+    buf: Vec<u8>,
+}
+
+pub(crate) struct ChannelReader {
+    stream: TcpStream,
+    noise: Arc<StatelessTransportState>,
+    nonce: u64,
     buf: Vec<u8>,
 }
 
 impl Channel {
-    /// Largest payload [`Channel::send`] accepts.
-    pub const MAX_PAYLOAD_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
+    /// Largest payload [`ChannelWriter::send`] accepts.
+    pub(crate) const MAX_PAYLOAD_LEN: usize = MAX_MESSAGE_LEN - TAG_LEN;
 
-    pub fn send(&mut self, payload: &[u8]) -> Result<()> {
-        if payload.len() > Self::MAX_PAYLOAD_LEN {
+    fn new(stream: TcpStream, noise: HandshakeState) -> Result<Self> {
+        let noise = Arc::new(noise.into_stateless_transport_mode()?);
+        Ok(Self {
+            writer: ChannelWriter {
+                stream: stream.try_clone()?,
+                noise: noise.clone(),
+                nonce: 0,
+                buf: Vec::new(),
+            },
+            reader: ChannelReader {
+                stream,
+                noise,
+                nonce: 0,
+                buf: Vec::new(),
+            },
+        })
+    }
+
+    fn stream(&self) -> &TcpStream {
+        &self.reader.stream
+    }
+
+    fn send(&mut self, payload: &[u8]) -> Result<()> {
+        self.writer.send(payload)
+    }
+
+    fn recv(&mut self) -> Result<Vec<u8>> {
+        self.reader.recv()
+    }
+
+    fn split(self) -> (ChannelWriter, ChannelReader) {
+        (self.writer, self.reader)
+    }
+}
+
+impl ChannelWriter {
+    pub(crate) fn send(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() > Channel::MAX_PAYLOAD_LEN {
             return Err(Error::Protocol("message too large"));
         }
         self.buf.resize(MAX_MESSAGE_LEN, 0);
-        let len = self.noise.write_message(payload, &mut self.buf)?;
+        let len = self
+            .noise
+            .write_message(self.nonce, payload, &mut self.buf)?;
+        self.nonce += 1;
         write_frame(&mut self.stream, &self.buf[..len])
     }
 
-    pub fn recv(&mut self) -> Result<Vec<u8>> {
+    /// Closes the connection in both directions, which also wakes up a
+    /// thread blocked in [`ChannelReader::recv`].
+    pub(crate) fn shutdown(&self) {
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl ChannelReader {
+    pub(crate) fn recv(&mut self) -> Result<Vec<u8>> {
         let message = read_frame(&mut self.stream)?;
         self.buf.resize(MAX_MESSAGE_LEN, 0);
-        let len = self.noise.read_message(&message, &mut self.buf)?;
+        let len = self
+            .noise
+            .read_message(self.nonce, &message, &mut self.buf)?;
+        self.nonce += 1;
         Ok(self.buf[..len].to_vec())
     }
 
-    /// Closes the connection in both directions.
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }

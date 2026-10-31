@@ -10,6 +10,12 @@ ferrokey-protocol.workspace = true
 ferrokey-input.workspace = true
 ferrokey-net.workspace = true
 getrandom = "0.4"
+jpeg-encoder = { version = "0.6", features = ["simd"] }
+
+[features]
+default = ["screen"]
+# Screen sharing; see ferrokey-input's feature of the same name.
+screen = ["ferrokey-input/screen"]
 
 [lints]
 workspace = true

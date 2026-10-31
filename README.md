@@ -36,8 +36,15 @@ The server listens on TCP port 47800 (`--listen` to change). On first run, or
 with `--pair`, it prints a six-digit pairing code; enter it in the app along
 with the computer's address. The code works once, and pairing closes after
 three wrong attempts. `--print-events` prints received events instead of
-injecting them, which is handy for testing the app. `--screen` and `--eis`
-are described under [Linux](#linux).
+injecting them, which is handy for testing the app. `--no-screen` turns off
+[screen sharing](#screen-sharing), and `--eis` is described under
+[Linux](#linux).
+
+On Linux, building the server needs the PipeWire development files and
+clang, for screen sharing: `sudo apt install libpipewire-0.3-dev clang`
+(Fedora: `sudo dnf install pipewire-devel clang`). To build without screen
+sharing, and without them, use
+`cargo build --release -p ferrokey-server --no-default-features`.
 
 The server's key and the list of paired devices live in
 `$XDG_CONFIG_HOME/ferrokey` (`%APPDATA%\ferrokey` on Windows). Delete a line
@@ -72,6 +79,25 @@ or `€` type wherever the active layout has them. A character the layout lacks
 may still be dropped, depending on the compositor. Named keys (arrows, F1–F12,
 the modifiers, ...) are sent as physical key positions.
 
+## Screen sharing
+
+Tap **Screen** in the app to see the computer's screen in place of the
+touchpad, which makes ferrokey a lightweight remote desktop. With **Point**
+selected, touches act like a touchscreen: tap to click where you tapped,
+drag to drag. **Touchpad** keeps the usual touchpad gestures over the
+picture.
+
+The server sends JPEG frames scaled to fit the phone (at most 1920 pixels
+on the long side), and only as fast as the phone keeps up: it waits for the
+phone to finish with a frame before sending more than two. Frames come only
+when something on screen changes, and capture stops while nobody watches or
+the app is in the background.
+
+Screen sharing is Linux-only for now (the Windows backend is still a stub),
+and connected phones need the app from the same version as the server: the
+protocol changed to carry frames, so older apps are told the server speaks
+a different protocol version.
+
 ## Linux
 
 Input is injected through the xdg-desktop-portal
@@ -80,23 +106,26 @@ interface, which is supported on GNOME and KDE Plasma. The first run shows a
 permission dialog; the restore token it returns is saved to
 `$XDG_STATE_HOME/ferrokey/portal-restore-token` so later runs skip it.
 
+The screen is shared through the same session, using the
+[ScreenCast](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)
+interface, so the dialog also asks which monitor to share (its token goes
+to `portal-restore-token-screen`). Frames arrive over
+[PipeWire](https://pipewire.org). The desktop shows its usual
+screen-sharing indicator while the server runs; use `--no-screen` if you
+only want input. Absolute pointing (the app's **Point** mode) is relative to
+the shared monitor, so it needs screen sharing too.
+
 Besides relative motion, buttons, wheel scrolling and keys, the server can
 inject keysyms (see [Keyboard](#keyboard)), touchpad-style smooth scrolling
-with kinetic scrolling at the end of a gesture, absolute pointer positions
-and multi-touch. The app doesn't send the last three yet.
+with kinetic scrolling at the end of a gesture, and multi-touch on the
+shared monitor (the session asks for a touchscreen device when the screen
+is shared). The app doesn't send smooth scrolling or multi-touch yet.
 
-- **`--screen`**: absolute pointer positions and touch need a shared screen,
-  since their positions are relative to it. With `--screen` the session
-  also shares your monitors through the ScreenCast portal (the dialog asks
-  which) and asks for a touchscreen device. The desktop shows this as screen
-  sharing, but nothing is recorded or sent anywhere. Positions on the wire
-  are fractions of the area covered by the shared monitors. Sessions with a
-  screen keep their own restore token, `portal-restore-token-screen`.
-- **`--eis`**: send input through [libei](https://libinput.pages.freedesktop.org/libei/)
-  over the portal's `ConnectToEIS` instead of one D-Bus call per event,
-  which has lower latency and overhead. It needs version 2 of the
-  RemoteDesktop portal. If the compositor's libei has no text input
-  (`ei_text`, libei 1.6), keysyms fall back to US QWERTY keys.
+`--eis` sends input through [libei](https://libinput.pages.freedesktop.org/libei/)
+over the portal's `ConnectToEIS` instead of one D-Bus call per event, which
+has lower latency and overhead. It needs version 2 of the RemoteDesktop
+portal. If the compositor's libei has no text input (`ei_text`, libei 1.6),
+keysyms fall back to US QWERTY keys.
 
 ### Not yet supported: wlroots compositors
 
@@ -140,5 +169,6 @@ cd android
 
 The app pairs with and connects to a server, then shows a touchpad
 (drag to move, tap to click, tap then touch again and
-hold to drag with the left button down) and left/right buttons. Servers are entered by
+hold to drag with the left button down) and left/right buttons, and can
+show the computer's screen. Servers are entered by
 address for now; there's no automatic discovery yet.
