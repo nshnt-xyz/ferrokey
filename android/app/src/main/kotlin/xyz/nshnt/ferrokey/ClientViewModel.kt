@@ -69,6 +69,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun send(event: InputEvent) {
+        // Late events, such as a button release from a gesture cancelled by
+        // disconnecting, are dropped; the server releases held buttons itself.
+        if (connectedTo == null) return
         try {
             client.send(event)
         } catch (e: ClientException) {

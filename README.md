@@ -98,5 +98,6 @@ cd android
 ```
 
 The app pairs with and connects to a server, then shows a touchpad
-(drag to move, tap to click) and left/right buttons. Servers are entered by
+(drag to move, tap to click, touch and hold to
+press the left button and drag with it) and left/right buttons. Servers are entered by
 address for now; there's no automatic discovery yet.
