@@ -1,5 +1,7 @@
 //! Wire types shared by the ferrokey client and server.
 
+pub mod keys;
+
 /// TCP port the server listens on unless told otherwise.
 pub const DEFAULT_PORT: u16 = 47800;
 

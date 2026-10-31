@@ -2,6 +2,7 @@ package xyz.nshnt.ferrokey
 
 import android.app.Application
 import android.os.Build
+import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -14,7 +15,9 @@ import kotlinx.coroutines.withContext
 import xyz.nshnt.ferrokey.core.Client
 import xyz.nshnt.ferrokey.core.ClientException
 import xyz.nshnt.ferrokey.core.InputEvent
+import xyz.nshnt.ferrokey.core.Modifiers
 import xyz.nshnt.ferrokey.core.PairedServer
+import xyz.nshnt.ferrokey.core.SpecialKey
 import java.io.File
 
 /**
@@ -68,12 +71,23 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
         error = message
     }
 
-    fun send(event: InputEvent) {
+    fun send(event: InputEvent) = sending { client.send(event) }
+
+    /** Types [text], skipping characters a US keyboard layout can't type. */
+    fun typeText(text: String, modifiers: Modifiers) = sending {
+        if (client.typeText(text, modifiers) > 0u) {
+            Toast.makeText(getApplication(), "Skipped characters a US keyboard can't type", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun tapKey(key: SpecialKey, modifiers: Modifiers) = sending { client.tapKey(key, modifiers) }
+
+    private inline fun sending(block: () -> Unit) {
         // Late events, such as a button release from a gesture cancelled by
         // disconnecting, are dropped; the server releases held buttons itself.
         if (connectedTo == null) return
         try {
-            client.send(event)
+            block()
         } catch (e: ClientException) {
             disconnect("Connection lost")
         }

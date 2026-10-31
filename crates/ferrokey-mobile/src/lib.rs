@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ferrokey_net::{KEEPALIVE_INTERVAL, Keypair, PublicKey, client};
+use ferrokey_protocol::keys::{self, Modifiers, SpecialKey};
 use ferrokey_protocol::{InputEvent, MouseButton};
 
 uniffi::setup_scaffolding!();
@@ -29,6 +30,51 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+}
+
+#[uniffi::remote(Enum)]
+pub enum SpecialKey {
+    Escape,
+    Tab,
+    Backspace,
+    Enter,
+    Insert,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Up,
+    Down,
+    Left,
+    Right,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+#[uniffi::remote(Record)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+}
+
+/// How many characters of `text` [`Client::type_text`] types, which is how
+/// many backspaces it takes to erase them again.
+#[uniffi::export]
+pub fn typable_len(text: String) -> u32 {
+    keys::typable_len(&text).try_into().unwrap_or(u32::MAX)
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -150,15 +196,41 @@ impl Client {
     }
 
     pub fn send(&self, event: InputEvent) -> Result<(), ClientError> {
+        self.send_all([event])
+    }
+
+    /// Types `text` as key presses, assuming the computer uses a US QWERTY
+    /// layout, while holding `modifiers`. Returns how many characters were
+    /// skipped because no key on that layout types them.
+    pub fn type_text(&self, text: String, modifiers: Modifiers) -> Result<u32, ClientError> {
+        let mut events = Vec::new();
+        let skipped = keys::type_text(&text, modifiers, &mut events);
+        self.send_all(events)?;
+        Ok(skipped.try_into().unwrap_or(u32::MAX))
+    }
+
+    /// Presses and releases `key` while holding `modifiers`.
+    pub fn tap_key(&self, key: SpecialKey, modifiers: Modifiers) -> Result<(), ClientError> {
+        let mut events = Vec::new();
+        keys::tap(key.code(), modifiers, &mut events);
+        self.send_all(events)
+    }
+}
+
+impl Client {
+    fn send_all(&self, events: impl IntoIterator<Item = InputEvent>) -> Result<(), ClientError> {
         let connection = self.connection.lock().unwrap();
         let connection = connection
             .as_ref()
             .filter(|c| c.is_alive())
             .ok_or(ClientError::NotConnected)?;
-        connection
-            .events
-            .send(event)
-            .map_err(|_| ClientError::NotConnected)
+        for event in events {
+            connection
+                .events
+                .send(event)
+                .map_err(|_| ClientError::NotConnected)?;
+        }
+        Ok(())
     }
 }
 
