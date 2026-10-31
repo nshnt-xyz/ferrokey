@@ -5,15 +5,22 @@ Cross-platform remote mouse and keyboard control (Linux Wayland + Windows), writ
 
 ```sh
 scripts/build.sh   # server + client (release) and the Android APK (debug)
-scripts/run.sh     # build, install the app on USB phones, start the server
+scripts/run.sh     # build, install the app on connected phones, start the server
 ```
 
-`scripts/run.sh` installs and launches the app on every phone connected over
-USB with USB debugging on (emulators are skipped), and sets up `adb reverse`
-so the phone can reach the server at `127.0.0.1` over the cable, no shared
-Wi-Fi needed. It then runs the server in the foreground; extra arguments go to
-the server, e.g. `scripts/run.sh --pair` or `scripts/run.sh --no-build
---print-events`. The USB forward is for the default port 47800.
+`scripts/run.sh` installs and launches the app on every phone connected to
+adb, over USB or wireless debugging (emulators are skipped), and sets up
+`adb reverse` so the phone can reach the server at `127.0.0.1` through adb.
+That works even where the phone can't reach the computer directly, since adb
+connects from the computer to the phone. It then runs the server in the
+foreground; extra arguments go to the server, e.g. `scripts/run.sh --pair` or
+`scripts/run.sh --no-build --print-events`. The forward is for the default
+port 47800.
+
+To use wireless debugging (Android 11+), turn it on under Developer options
+and connect once with `adb pair <ip:port>` (the "Pair device with pairing
+code" dialog) and `adb connect <ip:port>` (the port on the Wireless debugging
+screen).
 
 Both scripts need the Android build prerequisites listed under
 [Android app](#android-app). They're bash, so on Windows run them from WSL or
@@ -111,5 +118,6 @@ cd android
 ```
 
 The app pairs with and connects to a server, then shows a touchpad
-(drag to move, tap to click) and left/right buttons. Servers are entered by
+(drag to move, tap to click, tap then touch again and
+hold to drag with the left button down) and left/right buttons. Servers are entered by
 address for now; there's no automatic discovery yet.

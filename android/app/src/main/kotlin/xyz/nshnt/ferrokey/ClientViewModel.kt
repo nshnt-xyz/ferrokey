@@ -78,6 +78,9 @@ class ClientViewModel(application: Application) : AndroidViewModel(application) 
     fun tapKey(key: SpecialKey, modifiers: Modifiers) = sending { client.tapKey(key, modifiers) }
 
     private inline fun sending(block: () -> Unit) {
+        // Late events, such as a button release from a gesture cancelled by
+        // disconnecting, are dropped; the server releases held buttons itself.
+        if (connectedTo == null) return
         try {
             block()
         } catch (e: ClientException) {
