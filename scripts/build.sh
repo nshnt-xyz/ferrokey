@@ -24,6 +24,12 @@ if [[ ! -x $java_home/bin/javac ]]; then
     version="$(basename "$java_home" | grep -oE '[0-9]+' | head -1)"
     die "$java_home is a Java runtime without a compiler; install the JDK, e.g.: sudo apt install openjdk-${version:-21}-jdk"
 fi
+# Screen sharing on Linux links against libpipewire, and its bindings are
+# generated with libclang.
+if [[ $(uname -s) == Linux ]]; then
+    pkg-config --exists libpipewire-0.3 2>/dev/null \
+        || die "PipeWire development files not found (for screen sharing); install them, e.g.: sudo apt install libpipewire-0.3-dev clang (Fedora: sudo dnf install pipewire-devel clang)"
+fi
 sdk="$(find_sdk)" || die "Android SDK not found; set ANDROID_HOME or sdk.dir in android/local.properties"
 export ANDROID_HOME="$sdk"
 

@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use ferrokey_net::client::ServerMessage;
 use ferrokey_net::{KEEPALIVE_INTERVAL, Keypair, PublicKey, client};
 use ferrokey_protocol::keys::{self, Modifiers, SpecialKey};
 use ferrokey_protocol::{InputEvent, MouseButton};
@@ -23,6 +24,7 @@ pub enum InputEvent {
     MouseButton { button: MouseButton, pressed: bool },
     Scroll { dx: i32, dy: i32 },
     Key { code: u32, pressed: bool },
+    MouseMoveAbsolute { x: u16, y: u16 },
 }
 
 #[uniffi::remote(Enum)]
@@ -75,6 +77,27 @@ pub struct Modifiers {
 #[uniffi::export]
 pub fn typable_len(text: String) -> u32 {
     keys::typable_len(&text).try_into().unwrap_or(u32::MAX)
+}
+
+/// Receives the server's screen; see [`Client::start_screen`].
+///
+/// Called on a background thread. The server waits for `on_frame` to return
+/// before counting the frame as handled, so decoding it there is what keeps
+/// frames from piling up.
+#[uniffi::export(with_foreign)]
+pub trait ScreenListener: Send + Sync {
+    fn on_frame(&self, frame: ScreenFrame);
+    /// The server stopped sharing its screen. No more frames will come.
+    fn on_stopped(&self);
+}
+
+/// One frame of the server's screen.
+#[derive(uniffi::Record)]
+pub struct ScreenFrame {
+    pub width: u32,
+    pub height: u32,
+    /// A JPEG image.
+    pub jpeg: Vec<u8>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -181,7 +204,7 @@ impl Client {
     }
 
     pub fn disconnect(&self) {
-        // Dropping the connection's sender stops its thread.
+        // Dropping the connection stops its threads.
         self.connection.lock().unwrap().take();
     }
 
@@ -197,6 +220,57 @@ impl Client {
 
     pub fn send(&self, event: InputEvent) -> Result<(), ClientError> {
         self.send_all([event])
+    }
+
+    /// Whether the connected server can share its screen.
+    pub fn screen_available(&self) -> bool {
+        self.connection
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|connection| connection.screen_available)
+    }
+
+    /// Starts showing the server's screen, in frames that fit in
+    /// `max_width` by `max_height` pixels in either orientation, which go to
+    /// `listener` until [`Client::stop_screen`].
+    pub fn start_screen(
+        &self,
+        max_width: u32,
+        max_height: u32,
+        listener: Arc<dyn ScreenListener>,
+    ) -> Result<(), ClientError> {
+        let clamp = |size: u32| u16::try_from(size).unwrap_or(u16::MAX);
+        let connection = self.connection.lock().unwrap();
+        let connection = connection
+            .as_ref()
+            .filter(|c| c.is_alive())
+            .ok_or(ClientError::NotConnected)?;
+        *connection.listener.lock().unwrap() = Some(listener);
+        connection.queue(Outgoing::StartScreen(clamp(max_width), clamp(max_height)))
+    }
+
+    /// Stops showing the server's screen. Frames already on their way are
+    /// dropped.
+    pub fn stop_screen(&self) -> Result<(), ClientError> {
+        let connection = self.connection.lock().unwrap();
+        let Some(connection) = connection.as_ref() else {
+            return Ok(());
+        };
+        connection.listener.lock().unwrap().take();
+        connection.queue(Outgoing::StopScreen)
+    }
+
+    /// Moves the pointer to a point on the shared screen, given as fractions
+    /// of its width and height from the top left corner.
+    pub fn point_at(&self, x: f32, y: f32) -> Result<(), ClientError> {
+        let scale = |fraction: f32| {
+            (fraction.clamp(0.0, 1.0) * f32::from(InputEvent::ABSOLUTE_MAX)).round() as u16
+        };
+        self.send(InputEvent::MouseMoveAbsolute {
+            x: scale(x),
+            y: scale(y),
+        })
     }
 
     /// Types `text` as key presses, assuming the computer uses a US QWERTY
@@ -225,54 +299,154 @@ impl Client {
             .filter(|c| c.is_alive())
             .ok_or(ClientError::NotConnected)?;
         for event in events {
-            connection
-                .events
-                .send(event)
-                .map_err(|_| ClientError::NotConnected)?;
+            connection.queue(Outgoing::Event(event))?;
         }
         Ok(())
     }
 }
 
-/// An open session, written to by a dedicated thread so that sending never
-/// blocks the caller.
+/// What the writing thread sends.
+enum Outgoing {
+    Event(InputEvent),
+    StartScreen(u16, u16),
+    StopScreen,
+    FrameAck,
+    /// Hang up.
+    Close,
+}
+
+type SharedListener = Arc<Mutex<Option<Arc<dyn ScreenListener>>>>;
+
+/// An open session, with one thread writing to it, so that sending never
+/// blocks the caller, and another reading screen frames from it.
 struct Connection {
-    events: mpsc::Sender<InputEvent>,
+    outgoing: mpsc::Sender<Outgoing>,
     alive: Arc<AtomicBool>,
+    screen_available: bool,
+    listener: SharedListener,
 }
 
 impl Connection {
-    fn start(mut session: client::Session) -> Self {
-        let (events, rx) = mpsc::channel();
+    fn start(session: client::Session) -> Self {
+        let screen_available = session.screen_available();
+        let (mut sender, mut receiver) = session.split();
+        let (outgoing, rx) = mpsc::channel();
         let alive = Arc::new(AtomicBool::new(true));
+        let listener = SharedListener::default();
+
         let thread_alive = alive.clone();
         thread::spawn(move || {
-            let mut batch = Vec::new();
-            loop {
-                let result = match rx.recv_timeout(KEEPALIVE_INTERVAL) {
-                    Ok(event) => {
-                        // Coalesce whatever queued up while the last write ran.
-                        batch.clear();
-                        batch.push(event);
-                        batch.extend(rx.try_iter());
-                        session.send_events(&batch)
+            let mut queued = Vec::new();
+            let mut events = Vec::new();
+            'run: loop {
+                // Coalesce whatever queued up while the last write ran.
+                match rx.recv_timeout(KEEPALIVE_INTERVAL) {
+                    Ok(first) => {
+                        queued.clear();
+                        queued.push(first);
+                        queued.extend(rx.try_iter());
                     }
-                    Err(RecvTimeoutError::Timeout) => session.send_keepalive(),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if sender.send_keepalive().is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     Err(RecvTimeoutError::Disconnected) => break,
-                };
-                if result.is_err() {
+                }
+                for item in queued.drain(..) {
+                    if let Outgoing::Event(event) = item {
+                        events.push(event);
+                        continue;
+                    }
+                    let result = flush(&mut sender, &mut events).and_then(|()| match item {
+                        Outgoing::StartScreen(width, height) => sender.start_screen(width, height),
+                        Outgoing::StopScreen => sender.stop_screen(),
+                        Outgoing::FrameAck => sender.ack_frame(),
+                        Outgoing::Close | Outgoing::Event(_) => {
+                            Err(ferrokey_net::Error::Protocol("closed"))
+                        }
+                    });
+                    if result.is_err() {
+                        break 'run;
+                    }
+                }
+                if flush(&mut sender, &mut events).is_err() {
                     break;
                 }
             }
             thread_alive.store(false, Ordering::Relaxed);
-            session.shutdown();
+            // Also ends the reading thread's wait.
+            sender.shutdown();
         });
-        Self { events, alive }
+
+        let (thread_alive, thread_listener, acks) =
+            (alive.clone(), listener.clone(), outgoing.clone());
+        thread::spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                let listener = thread_listener.lock().unwrap().clone();
+                match message {
+                    ServerMessage::Frame(frame) => {
+                        if let Some(listener) = listener {
+                            listener.on_frame(ScreenFrame {
+                                width: frame.width.into(),
+                                height: frame.height.into(),
+                                jpeg: frame.jpeg,
+                            });
+                        }
+                        // Acknowledge even frames nobody wanted, so the server
+                        // never stalls waiting.
+                        if acks.send(Outgoing::FrameAck).is_err() {
+                            break;
+                        }
+                    }
+                    ServerMessage::ScreenStopped => {
+                        thread_listener.lock().unwrap().take();
+                        if let Some(listener) = listener {
+                            listener.on_stopped();
+                        }
+                    }
+                }
+            }
+            thread_alive.store(false, Ordering::Relaxed);
+            let _ = acks.send(Outgoing::Close);
+        });
+
+        Self {
+            outgoing,
+            alive,
+            screen_available,
+            listener,
+        }
+    }
+
+    fn queue(&self, item: Outgoing) -> Result<(), ClientError> {
+        self.outgoing
+            .send(item)
+            .map_err(|_| ClientError::NotConnected)
     }
 
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // The reading thread holds a sender too, so dropping ours isn't
+        // enough to stop the writing thread.
+        let _ = self.outgoing.send(Outgoing::Close);
+    }
+}
+
+/// Sends the input events collected so far.
+fn flush(sender: &mut client::Sender, events: &mut Vec<InputEvent>) -> ferrokey_net::Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let result = sender.send_events(events);
+    events.clear();
+    result
 }
 
 fn load_or_create_keypair(path: &Path) -> io::Result<Keypair> {

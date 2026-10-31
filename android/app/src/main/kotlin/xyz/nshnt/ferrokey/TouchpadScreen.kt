@@ -1,6 +1,7 @@
 package xyz.nshnt.ferrokey
 
 import android.os.SystemClock
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -26,30 +28,55 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
 import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import xyz.nshnt.ferrokey.core.InputEvent
 import xyz.nshnt.ferrokey.core.Modifiers
 import xyz.nshnt.ferrokey.core.MouseButton
 import xyz.nshnt.ferrokey.core.SpecialKey
+import kotlin.math.min
 import kotlin.math.roundToInt
+
+/** The computer's screen, as far as [TouchpadScreen] is concerned. */
+class ScreenState(
+    /** Whether the computer shares its screen at all. */
+    val available: Boolean,
+    val watching: Boolean,
+    /** The latest frame, once one has arrived. */
+    val frame: ImageBitmap?,
+    /** Starts showing the screen, in frames of at most this size. */
+    val start: (width: Int, height: Int) -> Unit,
+    val stop: () -> Unit,
+    /** Moves the pointer to a point on the screen, as fractions of its size. */
+    val pointAt: (x: Float, y: Float) -> Unit,
+)
 
 /**
  * A touchpad surface plus left/right buttons, connected to [address]. The
  * keyboard button brings up the soft keyboard, whose typing goes to the
  * computer, along with a row of keys it lacks.
+ *
+ * If the computer shares its screen, the touchpad can show it. Touches then
+ * point directly at what they land on, or work as a touchpad over the
+ * picture.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -59,12 +86,18 @@ fun TouchpadScreen(
     typeText: (String, Modifiers) -> Unit,
     tapKey: (SpecialKey, Modifiers) -> Unit,
     onDisconnect: () -> Unit,
+    screen: ScreenState,
 ) {
     val click = { button: MouseButton ->
         send(InputEvent.MouseButton(button, pressed = true))
         send(InputEvent.MouseButton(button, pressed = false))
     }
     var holding by remember { mutableStateOf(false) }
+    var padSize by remember { mutableStateOf(IntSize.Zero) }
+    // While the screen shows, whether touches point at it directly.
+    var direct by remember { mutableStateOf(true) }
+    val pointing = screen.watching && direct
+    val frame by rememberUpdatedState(screen.frame)
 
     // Modifiers from the key bar apply to the next key only.
     var modifiers by remember { mutableStateOf(NoModifiers) }
@@ -111,6 +144,15 @@ fun TouchpadScreen(
                     style = MaterialTheme.typography.titleMedium,
                     modifier = Modifier.weight(1f),
                 )
+                if (screen.available) {
+                    TextButton(
+                        onClick = {
+                            if (screen.watching) screen.stop() else screen.start(padSize.width, padSize.height)
+                        },
+                    ) {
+                        Text(if (screen.watching) "Hide screen" else "Screen")
+                    }
+                }
                 TextButton(onClick = onDisconnect) { Text("Disconnect") }
                 KeyboardCapture(focusRequester, onEdit = edit)
             }
@@ -118,11 +160,24 @@ fun TouchpadScreen(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .background(
-                        MaterialTheme.colorScheme.surfaceVariant,
-                        RoundedCornerShape(24.dp),
-                    )
-                    .pointerInput(Unit) {
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .onSizeChanged { padSize = it }
+                    .pointerInput(pointing) {
+                        if (pointing) {
+                            directGestures(
+                                pointAt = { position ->
+                                    frame?.let { frame ->
+                                        val point = fractionOn(frame, size, position)
+                                        screen.pointAt(point.x, point.y)
+                                    }
+                                },
+                                onPress = { send(InputEvent.MouseButton(MouseButton.LEFT, pressed = true)) },
+                                onRelease = { send(InputEvent.MouseButton(MouseButton.LEFT, pressed = false)) },
+                                onTap = { click(MouseButton.LEFT) },
+                            )
+                            return@pointerInput
+                        }
                         // Carry sub-pixel remainders over so slow drags still move.
                         var remainder = Offset.Zero
                         touchpadGestures(
@@ -147,14 +202,41 @@ fun TouchpadScreen(
                     },
                 contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    text = if (holding) "Holding" else "Touchpad",
-                    color = if (holding) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
+                val shown = screen.frame
+                when {
+                    screen.watching && shown != null -> Image(
+                        bitmap = shown,
+                        contentDescription = "Computer screen",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                    screen.watching -> Text(
+                        text = "Waiting for the screen…",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    else -> Text(
+                        text = if (holding) "Holding" else "Touchpad",
+                        color = if (holding) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                }
+            }
+            if (screen.watching) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = direct,
+                        onClick = { direct = true },
+                        label = { Text("Point") },
+                    )
+                    FilterChip(
+                        selected = !direct,
+                        onClick = { direct = false },
+                        label = { Text("Touchpad") },
+                    )
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 FilledTonalButton(onClick = { click(MouseButton.LEFT) }, modifier = Modifier.weight(1f)) {
@@ -236,6 +318,64 @@ private suspend fun PointerInputScope.touchpadGestures(
     // Pointer event times share this clock, and the finger has just lifted.
     val heldFor = SystemClock.uptimeMillis() - second.uptimeMillis
     if (!dragged && heldFor < DOUBLE_TAP_MAX_MILLIS) onTap()
+}
+
+/**
+ * Touchscreen-style gestures on the shown screen. Touching moves the pointer
+ * there through [pointAt]; lifting without moving past the touch slop is a
+ * tap, and moving further drags with the left button held from where the
+ * touch started.
+ */
+private suspend fun PointerInputScope.directGestures(
+    pointAt: (Offset) -> Unit,
+    onPress: () -> Unit,
+    onRelease: () -> Unit,
+    onTap: () -> Unit,
+) = awaitEachGesture {
+    val down = awaitFirstDown(requireUnconsumed = false)
+    down.consume()
+    pointAt(down.position)
+    var dragging = false
+    var lifted = false
+    try {
+        var travelled = Offset.Zero
+        while (true) {
+            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+            if (change.changedToUp()) {
+                change.consume()
+                lifted = true
+                break
+            }
+            travelled += change.positionChange()
+            change.consume()
+            if (!dragging && travelled.getDistance() > viewConfiguration.touchSlop) {
+                dragging = true
+                onPress()
+            }
+            if (dragging) pointAt(change.position)
+        }
+    } finally {
+        // Also runs if the gesture is cancelled, so a held button never sticks.
+        if (dragging) onRelease()
+    }
+    if (!dragging && lifted) onTap()
+}
+
+/**
+ * Where [position] in a [pad]-sized box falls on [frame] drawn in it with
+ * [ContentScale.Fit], as fractions of the frame's size. Points outside the
+ * picture snap to its edge.
+ */
+private fun fractionOn(frame: ImageBitmap, pad: IntSize, position: Offset): Offset {
+    val scale = min(pad.width / frame.width.toFloat(), pad.height / frame.height.toFloat())
+    val width = frame.width * scale
+    val height = frame.height * scale
+    val left = (pad.width - width) / 2
+    val top = (pad.height - height) / 2
+    return Offset(
+        ((position.x - left) / width).coerceIn(0f, 1f),
+        ((position.y - top) / height).coerceIn(0f, 1f),
+    )
 }
 
 /** Longest second touch that still counts as a double tap, not a hold. */

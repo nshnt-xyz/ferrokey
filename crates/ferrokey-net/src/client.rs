@@ -1,4 +1,5 @@
-//! The connecting side: pairs with or connects to a server and sends events.
+//! The connecting side: pairs with or connects to a server, sends events and
+//! receives screen frames.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
@@ -12,9 +13,43 @@ use crate::*;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An authenticated connection to a server.
+///
+/// [`Session::split`] separates it into a [`Sender`] and a [`Receiver`] for
+/// use from different threads.
 pub struct Session {
-    channel: Channel,
+    sender: Sender,
+    receiver: Receiver,
     server_key: PublicKey,
+    features: u8,
+}
+
+/// The sending half of a [`Session`].
+pub struct Sender {
+    channel: ChannelWriter,
+    payload: Vec<u8>,
+}
+
+/// The receiving half of a [`Session`].
+pub struct Receiver {
+    channel: ChannelReader,
+}
+
+/// A message from the server.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServerMessage {
+    /// A screen frame. Acknowledge it with [`Sender::ack_frame`] once it has
+    /// been shown, or the server stops sending more.
+    Frame(Frame),
+    /// The server is not sharing its screen (any more).
+    ScreenStopped,
+}
+
+/// One screen frame, a JPEG image.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub width: u16,
+    pub height: u16,
+    pub jpeg: Vec<u8>,
 }
 
 /// Pairs with the server at `address` using the code it is displaying.
@@ -49,14 +84,43 @@ impl Session {
         self.server_key
     }
 
+    /// Whether the server can share its screen; see [`Sender::start_screen`].
+    pub fn screen_available(&self) -> bool {
+        self.features & FEATURE_SCREEN != 0
+    }
+
+    pub fn send_events(&mut self, events: &[InputEvent]) -> Result<()> {
+        self.sender.send_events(events)
+    }
+
+    pub fn send_keepalive(&mut self) -> Result<()> {
+        self.sender.send_keepalive()
+    }
+
+    pub fn recv(&mut self) -> Result<ServerMessage> {
+        self.receiver.recv()
+    }
+
+    pub fn shutdown(&self) {
+        self.sender.shutdown();
+    }
+
+    pub fn split(self) -> (Sender, Receiver) {
+        (self.sender, self.receiver)
+    }
+}
+
+impl Sender {
     /// Sends `events`, split into as few messages as possible.
     pub fn send_events(&mut self, events: &[InputEvent]) -> Result<()> {
-        let per_message = Channel::MAX_PAYLOAD_LEN / InputEvent::MAX_ENCODED_LEN;
-        let mut payload = Vec::new();
+        let per_message = (Channel::MAX_PAYLOAD_LEN - 1) / InputEvent::MAX_ENCODED_LEN;
         for chunk in events.chunks(per_message) {
-            payload.clear();
-            chunk.iter().for_each(|event| event.encode(&mut payload));
-            self.channel.send(&payload)?;
+            self.payload.clear();
+            self.payload.push(MSG_INPUT);
+            chunk
+                .iter()
+                .for_each(|event| event.encode(&mut self.payload));
+            self.channel.send(&self.payload)?;
         }
         Ok(())
     }
@@ -64,6 +128,71 @@ impl Session {
     /// Tells the server the client is still there; see [`KEEPALIVE_INTERVAL`].
     pub fn send_keepalive(&mut self) -> Result<()> {
         self.channel.send(&[])
+    }
+
+    /// Asks the server to start sending screen frames no larger than
+    /// `max_width` by `max_height`, in either orientation.
+    pub fn start_screen(&mut self, max_width: u16, max_height: u16) -> Result<()> {
+        let mut message = [MSG_START_SCREEN, 0, 0, 0, 0];
+        message[1..3].copy_from_slice(&max_width.to_be_bytes());
+        message[3..5].copy_from_slice(&max_height.to_be_bytes());
+        self.channel.send(&message)
+    }
+
+    pub fn stop_screen(&mut self) -> Result<()> {
+        self.channel.send(&[MSG_STOP_SCREEN])
+    }
+
+    /// Acknowledges a [`ServerMessage::Frame`], letting the server send
+    /// another.
+    pub fn ack_frame(&mut self) -> Result<()> {
+        self.channel.send(&[MSG_FRAME_ACK])
+    }
+
+    /// Closes the connection, which also ends a blocked [`Receiver::recv`].
+    pub fn shutdown(&self) {
+        self.channel.shutdown();
+    }
+}
+
+impl Receiver {
+    /// Waits for the next message from the server.
+    pub fn recv(&mut self) -> Result<ServerMessage> {
+        let message = self.channel.recv()?;
+        match message.split_first() {
+            Some((&MSG_FRAME, rest)) => self.recv_frame(rest).map(ServerMessage::Frame),
+            Some((&MSG_SCREEN_STOPPED, [])) => Ok(ServerMessage::ScreenStopped),
+            _ => Err(Error::Protocol("unexpected message from server")),
+        }
+    }
+
+    /// Reassembles a frame from its first message, whose kind byte is
+    /// already gone, and however many data messages follow.
+    fn recv_frame(&mut self, header: &[u8]) -> Result<Frame> {
+        let bad = || Error::Protocol("malformed frame");
+        let (size, data) = header.split_first_chunk::<8>().ok_or_else(bad)?;
+        let width = u16::from_be_bytes([size[0], size[1]]);
+        let height = u16::from_be_bytes([size[2], size[3]]);
+        let len = u32::from_be_bytes([size[4], size[5], size[6], size[7]]) as usize;
+        if len > MAX_FRAME_LEN || data.len() > len {
+            return Err(bad());
+        }
+        let mut jpeg = Vec::with_capacity(len);
+        jpeg.extend_from_slice(data);
+        while jpeg.len() < len {
+            let message = self.channel.recv()?;
+            match message.split_first() {
+                Some((&MSG_FRAME_DATA, data)) if jpeg.len() + data.len() <= len => {
+                    jpeg.extend_from_slice(data);
+                }
+                _ => return Err(bad()),
+            }
+        }
+        Ok(Frame {
+            width,
+            height,
+            jpeg,
+        })
     }
 
     pub fn shutdown(&self) {
@@ -143,11 +272,7 @@ fn handshake(
     }
     send_handshake(&mut stream, &mut noise, device_name.as_bytes())?;
 
-    let mut channel = Channel {
-        stream,
-        noise: noise.into_transport_mode()?,
-        buf: Vec::new(),
-    };
+    let mut channel = Channel::new(stream, noise)?;
     let verdict = match channel.recv() {
         Ok(verdict) => verdict,
         // A wrong code makes the server's last handshake step fail, and all
@@ -157,17 +282,24 @@ fn handshake(
         }
         Err(err) => return Err(err),
     };
-    match verdict.as_slice() {
-        [VERDICT_ACCEPTED] => {}
+    let features = match verdict.as_slice() {
+        [VERDICT_ACCEPTED, features] => *features,
         [VERDICT_UNKNOWN_DEVICE] => return Err(Error::UnknownDevice),
         _ => return Err(Error::Protocol("unknown verdict")),
-    }
+    };
 
-    // The client never reads again, so only writes need a deadline.
-    channel.stream.set_read_timeout(None)?;
+    // The server only speaks when asked to, so waiting for it is open-ended;
+    // the client notices a dead server when a write fails.
+    channel.stream().set_read_timeout(None)?;
+    let (writer, reader) = channel.split();
     Ok(Session {
-        channel,
+        sender: Sender {
+            channel: writer,
+            payload: Vec::new(),
+        },
+        receiver: Receiver { channel: reader },
         server_key,
+        features,
     })
 }
 

@@ -36,7 +36,14 @@ The server listens on TCP port 47800 (`--listen` to change). On first run, or
 with `--pair`, it prints a six-digit pairing code; enter it in the app along
 with the computer's address. The code works once, and pairing closes after
 three wrong attempts. `--print-events` prints received events instead of
-injecting them, which is handy for testing the app.
+injecting them, which is handy for testing the app. `--no-screen` turns off
+[screen sharing](#screen-sharing).
+
+On Linux, building the server needs the PipeWire development files and
+clang, for screen sharing: `sudo apt install libpipewire-0.3-dev clang`
+(Fedora: `sudo dnf install pipewire-devel clang`). To build without screen
+sharing, and without them, use
+`cargo build --release -p ferrokey-server --no-default-features`.
 
 The server's key and the list of paired devices live in
 `$XDG_CONFIG_HOME/ferrokey` (`%APPDATA%\ferrokey` on Windows). Delete a line
@@ -69,6 +76,25 @@ decides what they type. The app assumes a US QWERTY layout; on other layouts
 some characters come out differently, and characters a US keyboard can't type
 (such as accented letters) are skipped.
 
+## Screen sharing
+
+Tap **Screen** in the app to see the computer's screen in place of the
+touchpad, which makes ferrokey a lightweight remote desktop. With **Point**
+selected, touches act like a touchscreen: tap to click where you tapped,
+drag to drag. **Touchpad** keeps the usual touchpad gestures over the
+picture.
+
+The server sends JPEG frames scaled to fit the phone (at most 1920 pixels
+on the long side), and only as fast as the phone keeps up: it waits for the
+phone to finish with a frame before sending more than two. Frames come only
+when something on screen changes, and capture stops while nobody watches or
+the app is in the background.
+
+Screen sharing is Linux-only for now (the Windows backend is still a stub),
+and connected phones need the app from the same version as the server: the
+protocol changed to carry frames, so older apps are told the server speaks
+a different protocol version.
+
 ## Linux
 
 Input is injected through the xdg-desktop-portal
@@ -76,6 +102,15 @@ Input is injected through the xdg-desktop-portal
 interface, which is supported on GNOME and KDE Plasma. The first run shows a
 permission dialog; the restore token it returns is saved to
 `$XDG_STATE_HOME/ferrokey/portal-restore-token` so later runs skip it.
+
+The screen is shared through the same session, using the
+[ScreenCast](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html)
+interface, so the dialog also asks which monitor to share (its token goes
+to `portal-restore-token-screen`). Frames arrive over
+[PipeWire](https://pipewire.org). The desktop shows its usual
+screen-sharing indicator while the server runs; use `--no-screen` if you
+only want input. Absolute pointing (the app's **Point** mode) is relative to
+the shared monitor, so it needs screen sharing too.
 
 ### Not yet supported: wlroots compositors
 
@@ -119,5 +154,6 @@ cd android
 
 The app pairs with and connects to a server, then shows a touchpad
 (drag to move, tap to click, tap then touch again and
-hold to drag with the left button down) and left/right buttons. Servers are entered by
+hold to drag with the left button down) and left/right buttons, and can
+show the computer's screen. Servers are entered by
 address for now; there's no automatic discovery yet.

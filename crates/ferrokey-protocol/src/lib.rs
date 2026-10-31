@@ -16,6 +16,11 @@ pub enum InputEvent {
     Scroll { dx: i32, dy: i32 },
     /// Key press or release, identified by a Linux evdev keycode.
     Key { code: u32, pressed: bool },
+    /// Moves the pointer to a point on the shared screen, given as fractions
+    /// of its width and height: 0 is the left or top edge and
+    /// [`InputEvent::ABSOLUTE_MAX`] the right or bottom one. Only works
+    /// while the server shares its screen.
+    MouseMoveAbsolute { x: u16, y: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,10 +56,14 @@ const TAG_MOUSE_MOVE: u8 = 1;
 const TAG_MOUSE_BUTTON: u8 = 2;
 const TAG_SCROLL: u8 = 3;
 const TAG_KEY: u8 = 4;
+const TAG_MOUSE_MOVE_ABSOLUTE: u8 = 5;
 
 impl InputEvent {
     /// Upper bound on the size of one encoded event.
     pub const MAX_ENCODED_LEN: usize = 9;
+
+    /// The largest coordinate of [`InputEvent::MouseMoveAbsolute`].
+    pub const ABSOLUTE_MAX: u16 = u16::MAX;
 
     /// Appends the binary encoding of this event to `out`.
     ///
@@ -85,6 +94,11 @@ impl InputEvent {
                 out.push(TAG_KEY);
                 out.extend_from_slice(&code.to_be_bytes());
                 out.push(pressed.into());
+            }
+            InputEvent::MouseMoveAbsolute { x, y } => {
+                out.push(TAG_MOUSE_MOVE_ABSOLUTE);
+                out.extend_from_slice(&x.to_be_bytes());
+                out.extend_from_slice(&y.to_be_bytes());
             }
         }
     }
@@ -118,6 +132,10 @@ impl InputEvent {
             TAG_KEY => InputEvent::Key {
                 code: reader.u32()?,
                 pressed: reader.bool()?,
+            },
+            TAG_MOUSE_MOVE_ABSOLUTE => InputEvent::MouseMoveAbsolute {
+                x: reader.u16()?,
+                y: reader.u16()?,
             },
             tag => return Err(DecodeError::UnknownTag(tag)),
         };
@@ -165,6 +183,10 @@ impl Reader<'_> {
         }
     }
 
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_be_bytes(self.take()?))
+    }
+
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_be_bytes(self.take()?))
     }
@@ -178,7 +200,7 @@ impl Reader<'_> {
 mod tests {
     use super::*;
 
-    const EVENTS: [InputEvent; 6] = [
+    const EVENTS: [InputEvent; 7] = [
         InputEvent::MouseMove {
             dx: -5,
             dy: i32::MAX,
@@ -199,6 +221,10 @@ mod tests {
         InputEvent::Key {
             code: u32::MAX,
             pressed: false,
+        },
+        InputEvent::MouseMoveAbsolute {
+            x: 0,
+            y: InputEvent::ABSOLUTE_MAX,
         },
     ];
 

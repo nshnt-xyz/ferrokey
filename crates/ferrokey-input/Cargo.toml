@@ -8,9 +8,15 @@ repository.workspace = true
 [dependencies]
 ferrokey-protocol.workspace = true
 
+[features]
+default = ["screen"]
+# Screen sharing on Linux, which links against libpipewire (build-time
+# package: libpipewire-0.3-dev on Debian/Ubuntu, pipewire-devel on Fedora).
+screen = ["dep:pipewire"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
-# `screencast` is only needed because ashpd's remote_desktop module imports it.
 ashpd = { version = "0.13", default-features = false, features = ["tokio", "remote_desktop", "screencast"] }
+pipewire = { version = "0.9", optional = true }
 tokio = { version = "1", features = ["rt", "sync"] }
 
 [lints]
