@@ -1,5 +1,6 @@
 package xyz.nshnt.ferrokey
 
+import android.os.SystemClock
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -117,9 +118,9 @@ fun TouchpadScreen(address: String, send: (InputEvent) -> Unit, onDisconnect: ()
  * as it moves. Lifting it without moving past the touch slop is a tap, but
  * [onTap] waits out the double-tap timeout first: touching again within it
  * (tap and a half) calls [onHoldStart] instead, and [onHoldEnd] when that
- * finger lifts, so moving in between drags. If the second touch doesn't move
- * past the slop either, it was a double tap, and [onTap] is called once more
- * to make it a double click.
+ * finger lifts, so moving in between drags. If the second touch is quick and
+ * doesn't move past the slop, it was a double tap, and [onTap] is called once
+ * more to make it a double click; a longer one is a held click.
  *
  * Holding the first click back keeps the drag's press from arriving right
  * after a click, which the computer would take as a double click.
@@ -155,8 +156,13 @@ private suspend fun PointerInputScope.touchpadGestures(
         onHoldEnd()
         onGestureEnd()
     }
-    if (!dragged) onTap()
+    // Pointer event times share this clock, and the finger has just lifted.
+    val heldFor = SystemClock.uptimeMillis() - second.uptimeMillis
+    if (!dragged && heldFor < DOUBLE_TAP_MAX_MILLIS) onTap()
 }
+
+/** Longest second touch that still counts as a double tap, not a hold. */
+private const val DOUBLE_TAP_MAX_MILLIS = 200L
 
 /**
  * Follows a touch until every finger lifts, switching to another finger if
